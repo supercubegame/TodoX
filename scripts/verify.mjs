@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 快闸门：零依赖，几十秒出结果。断言纯核心的真实行为 + 一批静态不变量 +
-// CI 配置自审（假绿、沉默通道、清单漂移）。
+// CI 配置自审（假绿、沉默通道、清单漂移、触发策略）。
 //
 // 每一条断言都问过同一个问题：如果这个功能完全没实现，这条会不会失败？
 // 不会失败的就是空断言，不许留在这里。
@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
-import { Report, GATES } from './lib/report.mjs';
+import { Report, GATES, RELEASE_GATES } from './lib/report.mjs';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -57,7 +57,7 @@ function walk(dir, out = []) {
   let entries = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
-    if (['node_modules', '.git', 'dist', 'artifacts'].includes(e.name)) continue;
+    if (['node_modules', '.git', 'dist', 'installers', 'artifacts'].includes(e.name)) continue;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) walk(p, out); else out.push(p);
   }
@@ -118,14 +118,35 @@ function sample() {
 }
 
 // ---------------------------------------------------------------- workflow 扫描器
-const WF_PATH = '.github/workflows/verify.yml';
-let wfText = null;
-function wf() { if (wfText == null) wfText = readIfExists(WF_PATH); return wfText; }
+// 每个函数都吃 text 参数：两条流水线共用同一套扫描器。以前只扫 verify.yml，
+// 那样 release.yml 可以自由地长出一个没有 pipefail 的 tee 而没人看得见 ——
+// 模板级的修复不会自己跨文件传染。
+const WF = {
+  verify: { path: '.github/workflows/verify.yml', text: null },
+  release: { path: '.github/workflows/release.yml', text: null }
+};
+function wf(key) {
+  if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
+  return WF[key].text;
+}
 
-function jobBlocks() {
-  const lines = wf().split('\n');
+function onBlock(text) {
+  const lines = text.split('\n');
+  const start = lines.findIndex(l => l.trimEnd() === 'on:');
+  if (start < 0) return [];
+  const out = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() !== '' && /^\S/.test(l)) break;
+    out.push(l);
+  }
+  return out;
+}
+
+function jobBlocks(text) {
+  const lines = text.split('\n');
   const start = lines.findIndex(l => l.trimEnd() === 'jobs:');
-  if (start < 0) fail('workflow 里找不到顶层 jobs:', wf().slice(0, 400));
+  if (start < 0) fail('workflow 里找不到顶层 jobs:', text.slice(0, 400));
   const jobs = new Map();
   let cur = null;
   for (let i = start + 1; i < lines.length; i++) {
@@ -139,8 +160,8 @@ function jobBlocks() {
   return jobs;
 }
 
-function runBlocks() {
-  const lines = wf().split('\n');
+function runBlocks(text) {
+  const lines = text.split('\n');
   const blocks = [];
   for (let i = 0; i < lines.length; i++) {
     const m = /^(\s*)run:\s*\|\s*$/.exec(lines[i]);
@@ -159,23 +180,25 @@ function runBlocks() {
   return blocks;
 }
 
-function matrixSlugs() {
-  return [...wf().matchAll(/^\s*slug:\s*([A-Za-z0-9_-]+)\s*$/gm)].map(m => m[1]);
+function matrixSlugs(text) {
+  return [...text.matchAll(/^\s*slug:\s*([A-Za-z0-9_-]+)\s*$/gm)].map(m => m[1]);
 }
 // ${{matrix.slug}} 一律写成不带空格的形式，这样 token 里不含空白，扫描器可以
 // 用「非空白直到 .log」切出来。带空格的写法会把这条扫描悄悄变成零命中。
-function expandMatrix(token) {
+function expandMatrix(text, token) {
   if (!token.includes('${{')) return [token];
   if (!token.includes('${{matrix.slug}}')) {
     fail('workflow 里出现了扫描器不认识的表达式', `token: ${token}（matrix.slug 必须写成不带空格的 \${{matrix.slug}}）`);
   }
-  return matrixSlugs().map(s => token.split('${{matrix.slug}}').join(s));
+  return matrixSlugs(text).map(s => token.split('${{matrix.slug}}').join(s));
 }
-function tokenSet(re) {
+function tokenSet(text, re) {
   const out = new Set();
-  for (const m of wf().matchAll(re)) for (const v of expandMatrix(m[1])) out.add(v);
+  for (const m of text.matchAll(re)) for (const v of expandMatrix(text, m[1])) out.add(v);
   return out;
 }
+const RE_REPORT = /name:\s*(report-[^\s]+)/g;
+const RE_STDOUT = /stdout-([^\s`'"]+?)\.log/g;
 
 // ---------------------------------------------------------------- 检查清单
 const report = new Report('快闸门（纯核心 + 静态断言）');
@@ -499,57 +522,71 @@ const CHECKS = [
     return `同一份内容，${a.length} 字节`;
   }],
 
-  ['CI：出现 tee 的脚本块都设置了 pipefail', () => {
-    const blocks = runBlocks();
-    expectTrue(blocks.length > 0, '一个 run: | 块都没扫到 —— 是扫描器坏了，不是配置对了', wf().slice(0, 500));
-    const teeBlocks = blocks.filter(b => b.body.includes('tee '));
-    expectTrue(teeBlocks.length > 0, '没有任何 tee 块 —— 那报告缺失时评论里就没有日志尾巴了');
-    const bad = teeBlocks.filter(b => !b.body.includes('pipefail')).map(b => `第 ${b.line} 行的 run 块`);
+  ['CI：所有 workflow 里出现 tee 的脚本块都设置了 pipefail', () => {
+    let totalRun = 0;
+    let totalTee = 0;
+    const bad = [];
+    for (const key of Object.keys(WF)) {
+      const blocks = runBlocks(wf(key));
+      expectTrue(blocks.length > 0, `${WF[key].path} 里一个 run: | 块都没扫到 —— 是扫描器坏了，不是配置对了`, wf(key).slice(0, 400));
+      const tee = blocks.filter(b => b.body.includes('tee '));
+      expectTrue(tee.length > 0, `${WF[key].path} 里没有任何 tee 块 —— 那报告缺失时评论里就没有日志尾巴了`);
+      totalRun += blocks.length;
+      totalTee += tee.length;
+      for (const b of tee) if (!b.body.includes('pipefail')) bad.push(`${WF[key].path} 第 ${b.line} 行的 run 块`);
+    }
     expectEq(bad, [], '缺 pipefail 的 tee 块');
-    return `${blocks.length} 个 run 块，其中 ${teeBlocks.length} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
+    return `${Object.keys(WF).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
   }],
 
   ['CI：report job 用共享 workflow，且没有自己长出 steps', () => {
-    const jobs = jobBlocks();
-    const j = jobs.get('summary');
-    expectTrue(Boolean(j), 'workflow 里没有 summary job', [...jobs.keys()].join(','));
-    expectTrue(j.text.includes('uses: supercubegame/ci-workflows/.github/workflows/report.yml@main'), 'summary 没有引用共享回写 workflow', j.text.slice(0, 600));
-    const hasSteps = j.lines.some(l => l.trim() === 'steps:');
-    expectTrue(!hasSteps, 'summary 自己长出了 steps —— 回写逻辑必须只有一份', j.text.slice(0, 600));
-    return '引用 ci-workflows/report.yml@main，本地零 steps';
+    const bad = [];
+    for (const key of Object.keys(WF)) {
+      const jobs = jobBlocks(wf(key));
+      const j = jobs.get('summary');
+      expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job`, [...jobs.keys()].join(','));
+      if (!j.text.includes('uses: supercubegame/ci-workflows/.github/workflows/report.yml@main')) bad.push(`${WF[key].path} 没有引用共享回写 workflow`);
+      if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
+    }
+    expectEq(bad, [], '回写 job 的问题');
+    return '两份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps';
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
-    const j = jobBlocks().get('summary');
-    const needsLine = j.lines.find(l => l.trim().startsWith('needs:'));
-    expectTrue(Boolean(needsLine), 'summary 没有 needs', j.text.slice(0, 400));
-    const needs = needsLine.replace(/.*\[/, '').replace(/\].*/, '').split(',').map(s => s.trim()).filter(Boolean);
-    const gatesLine = j.lines.find(l => l.trim().startsWith('gates:'));
-    expectTrue(Boolean(gatesLine), 'summary 没有 gates 输入', j.text.slice(0, 400));
-    const refs = [...gatesLine.matchAll(/needs\.([A-Za-z0-9_-]+)\.result/g)].map(m => m[1]);
-    expectEq(refs.slice().sort(), needs.slice().sort(), 'gates 引用的 job 集合');
-    const jobs = jobBlocks();
-    for (const n of needs) expectTrue(jobs.has(n), `needs 里的 ${n} 不是真实存在的 job`, [...jobs.keys()].join(','));
-    expectTrue(!/"result"\s*:\s*"(success|failure)"/.test(gatesLine), 'gates 里写了硬编码的结果字面量', gatesLine);
-    return `needs=[${needs.join(',')}]，gates 逐个引用真实 result，没有硬编码`;
+    const summary = [];
+    for (const key of Object.keys(WF)) {
+      const jobs = jobBlocks(wf(key));
+      const j = jobs.get('summary');
+      const needsLine = j.lines.find(l => l.trim().startsWith('needs:'));
+      expectTrue(Boolean(needsLine), `${WF[key].path} 的 summary 没有 needs`, j.text.slice(0, 400));
+      const needs = needsLine.replace(/.*\[/, '').replace(/\].*/, '').split(',').map(s => s.trim()).filter(Boolean);
+      const gatesLine = j.lines.find(l => l.trim().startsWith('gates:'));
+      expectTrue(Boolean(gatesLine), `${WF[key].path} 的 summary 没有 gates 输入`, j.text.slice(0, 400));
+      const refs = [...gatesLine.matchAll(/needs\.([A-Za-z0-9_-]+)\.result/g)].map(m => m[1]);
+      expectEq(refs.slice().sort(), needs.slice().sort(), `${WF[key].path} 的 gates 引用的 job 集合`);
+      for (const n of needs) expectTrue(jobs.has(n), `${WF[key].path} 的 needs 里 ${n} 不是真实存在的 job`, [...jobs.keys()].join(','));
+      expectTrue(!/"result"\s*:\s*"(success|failure)"/.test(gatesLine), `${WF[key].path} 的 gates 里写了硬编码的结果字面量`, gatesLine);
+      summary.push(`${key}=[${needs.join(',')}]`);
+    }
+    return `${summary.join('｜')}，全部引用真实 result，没有硬编码`;
   }],
 
-  ['CI：上传的 report-* 产物集合与闸门清单一致', () => {
-    const names = tokenSet(/name:\s*(report-[^\s]+)/g);
+  ['CI：verify 上传的 report-* 产物集合与 GATES 一致', () => {
+    const names = tokenSet(wf('verify'), RE_REPORT);
     const want = new Set(GATES.map(g => `report-${g.slug}`));
     expectEq([...names].sort(), [...want].sort(), '产物名集合');
     return `${names.size} 个产物名与 GATES 一一对应`;
   }],
 
-  ['CI：stdout-<slug>.log 集合与闸门清单一致', () => {
-    const slugs = tokenSet(/stdout-([^\s`'"]+?)\.log/g);
+  ['CI：verify 的 stdout-<slug>.log 集合与 GATES 一致', () => {
+    const slugs = tokenSet(wf('verify'), RE_STDOUT);
     const want = new Set(GATES.map(g => g.slug));
     expectEq([...slugs].sort(), [...want].sort(), 'stdout 日志 slug 集合');
     return `${slugs.size} 条日志与 GATES 一一对应，composer 不会去找一个没人产出的 slug`;
   }],
 
-  ['CI：闸门 job 上没有 job 级 if（不会静默不跑）', () => {
-    const jobs = jobBlocks();
+  ['CI：verify 的闸门 job 上没有 job 级 if（不会静默不跑）', () => {
+    const jobs = jobBlocks(wf('verify'));
     const offenders = [];
     for (const [name, j] of jobs) {
       if (name === 'summary') continue;
@@ -558,6 +595,57 @@ const CHECKS = [
     expectEq(offenders, [], '带 job 级 if 的闸门 job');
     expectTrue(jobs.size >= 4, 'job 数量少于预期', [...jobs.keys()].join(','));
     return `${jobs.size - 1} 条闸门 job 全部无条件执行 —— 条件写歪会让 job 静默永不执行，而 run 依然全绿`;
+  }],
+
+  ['CI：release 只在 release/** 上触发，而 verify 覆盖所有分支（双向）', () => {
+    const on = onBlock(wf('release'));
+    expectTrue(on.length > 0, 'release.yml 里解析不到 on: 块 —— 是扫描器坏了，不是配置对了', wf('release').slice(0, 300));
+    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
+    expectEq(branches, ["branches: ['release/**']"], 'release.yml 的分支过滤');
+    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'release.yml 没有手动触发的口子', on.join('\n'));
+    expectTrue(!on.some(l => /pull_request|schedule/.test(l)), 'release.yml 挂上了不该挂的事件', on.join('\n'));
+    // 反方向：发布分支上也必须过一遍全套闸门。verify 的范围一旦被改窄，
+    // release 分支就会在没验过的情况下直接打包发出去。
+    const vb = onBlock(wf('verify')).filter(l => l.includes('branches:')).map(l => l.trim());
+    expectEq(vb, ["branches: ['**']"], 'verify.yml 的分支过滤');
+    return "release 只认 release/**（不挂 main，不挂 **），verify 仍覆盖 ** —— 该跑不跑要红，不该跑却跑了也要红";
+  }],
+
+  ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
+    const slugs = matrixSlugs(wf('release')).slice().sort();
+    const want = RELEASE_GATES.map(g => g.slug).filter(s => s.startsWith('dist-')).sort();
+    expectEq(slugs, want, 'matrix slug 集合');
+    const oses = [...wf('release').matchAll(/^\s*- os:\s*([^\s]+)\s*$/gm)].map(m => m[1]);
+    expectEq(oses.length, 3, 'runner 数量');
+    expectEq(new Set(oses).size, 3, '互不相同的 runner 数量');
+    return `${slugs.join(' / ')} 跑在 ${oses.join(' / ')} 上 —— 少一个平台就红，不是「至少三个」`;
+  }],
+
+  ['CI：release 的产物名与 stdout 日志集合都等于 RELEASE_GATES', () => {
+    const names = tokenSet(wf('release'), RE_REPORT);
+    const wantNames = new Set(RELEASE_GATES.map(g => `report-${g.slug}`));
+    expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
+    const slugs = tokenSet(wf('release'), RE_STDOUT);
+    const wantSlugs = new Set(RELEASE_GATES.map(g => g.slug));
+    expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
+    return `${names.size} 个产物 + ${slugs.size} 条日志，与 RELEASE_GATES 完全相等`;
+  }],
+
+  ['CI：release 的校验与回写带 if: always()，构建与发布无条件执行', () => {
+    const jobs = jobBlocks(wf('release'));
+    for (const n of ['dist', 'publish', 'verify', 'summary']) {
+      expectTrue(jobs.has(n), `release.yml 里没有 ${n} job`, [...jobs.keys()].join(','));
+    }
+    const anyIf = n => jobs.get(n).lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim());
+    const alwaysIf = n => anyIf(n).some(l => /^if:\s*always\(\)$/.test(l));
+    // 这两个必须 always：上游炸了它们也要跑，然后如实报「读不到 Release」。
+    // 静默跳过和「验过了没问题」在面板上长得一模一样。
+    expectTrue(alwaysIf('verify'), 'verify job 没有 if: always()，上游失败时它会被静默跳过', anyIf('verify').join('\n') || '（没有任何 if）');
+    expectTrue(alwaysIf('summary'), 'summary job 没有 if: always()', anyIf('summary').join('\n') || '（没有任何 if）');
+    // 这两个不许有条件：写歪了会让整条发布静默永不执行，而 run 依然全绿。
+    expectEq(anyIf('dist'), [], 'dist job 上的 job 级 if');
+    expectEq(anyIf('publish'), [], 'publish job 上的 job 级 if');
+    return 'verify / summary 带 always()，dist / publish 无条件 —— 四个方向都断言过';
   }],
 
   ['密钥：哨兵在源码与报告里出现 0 次（负向）', () => {
