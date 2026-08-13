@@ -9,11 +9,14 @@
 //
 // 所以正向痕迹用 **sha256 摘要**：逐个比对私有仓与公开仓同名资产的 digest。
 // 名字只能证明「有个叫这个名的文件」，摘要能证明「就是刚打出来的那份字节」。
-// 这是「验最终产物，不验接口被调用过」的同一条规矩。
 //
 // **审计时公开仓的 Release 必须还是草稿。** 顺序是：建草稿 -> 上传 -> 审计 ->
 // 通过了才转正。第一版写反了，结果那次失败留下一个「对外可见但 0 个资产」的
 // Release,那正是我在私有仓那条链路上防住、却在这条上重犯的错。
+//
+// **最后一条是覆盖缺口的解药**：前面每条都只看「当次这个 tag」，所以旁边躺一个
+// 上一轮失败留下的空发布是完全隐形的。往外部系统写东西的审计，除了「我这次
+// 写对了吗」，还要问「那个系统里现在有没有不该存在的东西」。
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -43,7 +46,7 @@ if (TAG === '') {
 }
 
 const report = new Report('公开仓 Release 同步校验');
-const state = { src: null, mirror: null };
+const state = { src: null, mirror: null, mirrorAll: null };
 
 function fail(msg, evidence) {
   const e = new Error(msg);
@@ -62,7 +65,7 @@ function mb(n) { return `${(n / 1024 / 1024).toFixed(1)} MB`; }
 // 「Cannot read properties of null」—— 那是噪音，不是根因，而报告的价值就在于
 // 「只看这条评论能不能定位根因」。依赖顺序上的失败要归因到最前面那个。
 function requireLoaded(which, value, firstCheck) {
-  expectTrue(value !== null, `${which}还没读到，这条无从谈起`,
+  expectTrue(value !== null && value !== undefined, `${which}还没读到，这条无从谈起`,
     `根因在前面那条「${firstCheck}」,先看它的证据，别在这里找。`);
   return value;
 }
@@ -107,22 +110,24 @@ function shape(rel) {
 //
 // 这个坑的形状值得记：**审计的读取路径本身也有前提**，而那个前提被我上一轮
 // 改发布顺序时弄坏了。闸门红了先查夹具。
-function findRelease(repo, label) {
+function listReleases(repo, label) {
   const raw = gh(['api', `repos/${repo}/releases?per_page=100`], label);
   const list = JSON.parse(raw);
   expectTrue(Array.isArray(list), `${label}：返回的不是数组`, raw.slice(0, 400));
   expectTrue(list.length > 0, `${label}：${repo} 上一个 Release 都没有`, '同步那步大概整体没跑起来');
+  return list;
+}
+function pickTag(list, repo, label) {
   const hit = list.find(r => r.tag_name === TAG);
   expectTrue(Boolean(hit), `${label}：${repo} 上找不到 ${TAG}`,
     `现有 tag：${list.map(r => `${r.tag_name}${r.draft ? '(草稿)' : ''}`).join(', ')}`);
   return shape(hit);
 }
 
-// 私有仓那边是已经转正的正式发布，按 tag 取没问题；但用同一条路径读两边
-// 更少一个分歧点。
 const CHECKS = [
   ['读到私有仓这个 tag 的真实资产（先证明解析成功）', () => {
-    state.src = findRelease(SRC_REPO, '读取源 Release');
+    const list = listReleases(SRC_REPO, '读取源 Release');
+    state.src = pickTag(list, SRC_REPO, '读取源 Release');
     expectEq(state.src.tag, TAG, '源 Release 的 tag');
     requireAssets('私有仓 Release 上', state.src.assets);
     expectEq(state.src.assets.length, EXPECT_TOTAL, '源 Release 的资产数');
@@ -132,7 +137,8 @@ const CHECKS = [
   }],
 
   ['读到公开仓同 tag 的资产，且它还是草稿（转正在审计之后）', () => {
-    state.mirror = findRelease(MIRROR_REPO, '读取镜像 Release');
+    state.mirrorAll = listReleases(MIRROR_REPO, '读取镜像 Release');
+    state.mirror = pickTag(state.mirrorAll, MIRROR_REPO, '读取镜像 Release');
     expectEq(state.mirror.tag, TAG, '镜像 Release 的 tag');
     requireAssets('公开仓 Release 上', state.mirror.assets);
     // 顺序断言：审计跑的时候它必须还没对外可见。写反了就会留下一个
@@ -200,6 +206,22 @@ const CHECKS = [
       'state 也是 uploaded —— 只有摘要能看出来它不是这次打的那一份。');
     const sample = state.mirror.assets[0];
     return `${EXPECT_TOTAL} 个摘要逐一相同（例：${sample.name} ${String(sample.digest).slice(0, 23)}…）`;
+  }],
+
+  // **覆盖缺口的解药。** 上面每一条都只看「当次这个 tag」，所以公开仓里躺一个
+  // 上一轮失败留下的空发布是完全隐形的 —— 实测真的躺了一个。
+  // 对下载的人来说，一个 0 资产的正式发布就是一个死链。
+  ['公开仓没有 0 资产的正式发布（负向孪生，扫全部而不只是当次）', () => {
+    requireLoaded('公开仓 Release 列表', state.mirrorAll, '读到公开仓同 tag 的资产');
+    const empty = state.mirrorAll
+      .filter(r => r.draft === false && (r.assets || []).length === 0)
+      .map(r => `${r.tag_name}（${r.html_url}）`);
+    expectTrue(empty.length === 0, `公开仓上有 ${empty.length} 个 0 资产的正式发布 —— 对下载的人是死链`,
+      `${empty.join('\n')}\n\n` +
+      '前面每条断言都只看当次这个 tag，所以这类残留是隐形的。\n' +
+      '删掉那个发布（以及它的 tag）即可。草稿不算 —— 草稿本身就在喊「没完成」。');
+    const drafts = state.mirrorAll.filter(r => r.draft === true).length;
+    return `${state.mirrorAll.length} 个发布里 0 个空的正式发布（其中 ${drafts} 个草稿，不算）`;
   }],
 
   ['自检：本次实际执行的检查数等于清单数', () => {

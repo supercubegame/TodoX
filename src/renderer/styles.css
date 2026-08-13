@@ -1,5 +1,6 @@
 /* 主题令牌。改这两个背景色必须同步改端到端闸门里的 LIGHT_BG / DARK_BG，
-   否则闸门红的是尺子不是产品。见 AGENTS.md「相互耦合的参数」。 */
+   以及 lib/shots.mjs 的 THEME_BG，否则闸门红的是尺子不是产品。
+   见 AGENTS.md「相互耦合的参数」。 */
 body[data-theme="light"] {
   --bg: #f6f7f9;
   --fg: #1a1d22;
@@ -49,6 +50,8 @@ input, select, button {
 button { cursor: pointer; }
 button.on { background: var(--accent); color: #fff; border-color: transparent; }
 button.danger { background: #e5484d; color: #fff; border-color: transparent; }
+/* 撤销 / 重做不可用时要看得出来。禁用状态由主进程给的摘要驱动，界面不自己算。 */
+button:disabled { opacity: 0.45; cursor: default; }
 input[type="checkbox"], input[type="range"] { padding: 0; border: 0; background: none; }
 
 .composer { display: flex; gap: 10px; }
@@ -56,7 +59,8 @@ input[type="checkbox"], input[type="range"] { padding: 0; border: 0; background:
 
 .error { color: #e5484d; margin: 10px 0 0; font-size: 0.9rem; }
 
-.filters { display: flex; gap: 8px; margin: 14px 0 10px; }
+.filters { display: flex; align-items: center; gap: 8px; margin: 14px 0 10px; }
+.filters .spacer { flex: 1; }
 
 .list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 
@@ -70,8 +74,9 @@ input[type="checkbox"], input[type="range"] { padding: 0; border: 0; background:
   padding: 10px 12px;
 }
 
-/* 探针条：这个颜色在整个应用里只允许出现在这里。端到端闸门数的就是它，
-   而「空列表时必须为 0 像素」这条负向孪生一旦被别处复用就变成空断言。 */
+/* 探针条：这个颜色在整个应用里只允许出现在这里。端到端闸门与截图生成器数的
+   就是它,「空列表时必须为 0 像素」和「探针像素 == 行数 x 164」这两条断言
+   一旦被别处复用就都变成空的。改宽高必须重算 PROBE_PER_ROW。 */
 .probe { flex: none; width: 8px; height: 22px; border-radius: 2px; background: #00d684; }
 
 .item .title { flex: 1; font-size: 1rem; }
