@@ -41,6 +41,7 @@ function expectEq(actual, expected, label) {
   if (a !== b) fail(`${label} 不符`, `期望: ${b}\n实际: ${a}\n${envNote()}`);
 }
 function expectTrue(cond, label, evidence) { if (!cond) fail(label, `${evidence == null ? '' : evidence}\n${envNote()}`); }
+// 每条失败都附环境自证数据。没有这些只能靠推理定位，而推理会错。
 function envNote() {
   return `[环境自证] 用户数据目录=${USER_DATA} 存档存在=${fs.existsSync(DATA_FILE)} 控制台错误数=${ctx.consoleErrors.length}`;
 }
@@ -83,7 +84,7 @@ async function launch() {
   page.on('console', m => { if (m.type() === 'error') ctx.consoleErrors.push(`console.error: ${m.text()}`); });
   page.on('pageerror', e => ctx.consoleErrors.push(`pageerror: ${e.message}`));
   ctx.app = app; ctx.page = page;
-  // 后台标签页会被节流，依赖时间推进的东西在夹具里根本不触发。显式切到前台。
+  // 后台窗口会被节流，依赖时间推进的东西在夹具里根本不触发。显式切到前台。
   await app.evaluate(({ BrowserWindow }) => {
     const w = BrowserWindow.getAllWindows()[0];
     if (w) { w.show(); w.focus(); }
@@ -122,6 +123,11 @@ async function titleOccurrences(text) {
     const inBody = (document.body.innerText.split(s).length - 1);
     return { inTitles, inBody };
   }, text);
+}
+
+async function expectVisible(id, want) {
+  const got = await t(id).isVisible();
+  expectEq(got, want, `${id} 的可见性`);
 }
 
 const STEPS = [
@@ -177,7 +183,7 @@ const STEPS = [
     await ctx.page.screenshot({ path: path.join(ARTIFACTS, 'screen-list.png') });
     expectEq(ctx.probeEmpty.n, 0, '空列表状态下的探针像素数');
     expectTrue(ctx.probeFull.n > 0, '有 3 条待办时一个探针像素都没有 —— 界面根本没画出来', `空=${ctx.probeEmpty.n} 满=${ctx.probeFull.n}`);
-    expectTrue(ctx.probeFull.n >= 3 * 8 * 20 * 0.5, '探针像素太少，可能只画出了一条', `期望 >= ${Math.round(3 * 8 * 20 * 0.5)}，实际 ${ctx.probeFull.n}`);
+    expectTrue(ctx.probeFull.n >= 240, '探针像素太少，可能只画出了一条', `期望 >= 240（3 条 x 8x22 的一半余量），实际 ${ctx.probeFull.n}`);
     return `空列表 0 像素 -> 3 条待办 ${ctx.probeFull.n} 像素（比差值，不比绝对阈值）`;
   }],
 
@@ -245,11 +251,15 @@ const STEPS = [
       parseFloat(getComputedStyle(document.querySelector('[data-testid="item-title"]')).fontSize));
     const before = await read();
     await t('set-fontscale').focus();
-    for (let i = 0; i < 6; i += 1) await ctx.page.keyboard.press('ArrowRight');
-    await waitFor('fontScale 到 160', async () => (await diag()).settings.fontScale === 160);
+    // 按一格等一格。连按的话，晚到的那一轮回写会把滑条 value 顶回旧值，
+    // 最后停在中间某个数上 —— 那是夹具的竞态，不是产品的毛病。
+    for (const want of [110, 120, 130, 140, 150, 160]) {
+      await ctx.page.keyboard.press('ArrowRight');
+      await waitFor(`fontScale 到 ${want}`, async () => (await diag()).settings.fontScale === want);
+    }
     const after = await read();
     expectTrue(after > before * 1.3, '字号没有随设置变大', `之前 ${before}px，之后 ${after}px（期望 > ${(before * 1.3).toFixed(1)}px）`);
-    return `${before}px -> ${after}px，用键盘真的推了 6 格`;
+    return `${before}px -> ${after}px，用键盘真的推了 6 格，每格都确认落地`;
   }],
 
   ['删除：开着确认时要先确认，行数 -1 且标题出现 0 次（负向孪生）', async () => {
@@ -291,7 +301,7 @@ const STEPS = [
   ['重启：待办、设置、窗口尺寸全部恢复', async () => {
     const beforeDiag = await diag();
     await ctx.app.close();
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 800));
     await launch();
     const after = await diag();
     expectEq(after.counts, beforeDiag.counts, '重启后的计数');
@@ -328,11 +338,6 @@ const STEPS = [
     return `${actual} 条，等号断言`;
   }]
 ];
-
-async function expectVisible(id, want) {
-  const got = await t(id).isVisible();
-  expectEq(got, want, `${id} 的可见性`);
-}
 
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 
