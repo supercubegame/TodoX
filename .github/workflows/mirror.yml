@@ -1,0 +1,132 @@
+name: mirror
+
+# 推 main 就同步一次公开镜像。无条件跑：用条件表达式去「省资源」，会得到一条
+# 写歪之后静默永不执行的流水线，而所有 run 依然全绿。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 同步到公开镜像
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # secret 缺失**不许静默跳过**。静默跳过和「同步成功」在面板上长得一模一样，
+      # 而这条流水线的全部意义就是「别把不该给的东西给出去」—— 它失效时我必须
+      # 立刻知道。这里明确报「没有同步任何东西」并让整个 job 红。
+      - name: 确认镜像令牌存在
+        shell: bash
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MIRROR_TOKEN:-}" ]; then
+            echo '未配置 MIRROR_TOKEN，本次没有同步任何东西（不是「同步成功」）。'
+            echo '需要一个对 supercubegame/todox-desktop 有 contents:write 权限的 PAT，'
+            echo '填在本仓库 Settings -> Secrets and variables -> Actions -> MIRROR_TOKEN。'
+            exit 1
+          fi
+          echo '令牌就位'
+
+      # 白名单式拷贝：只挑 mirror.mjs 里 ALLOW_TOP 允许的东西。
+      # 黑名单会在新增目录时默认泄漏，方向是反的。
+      - name: 构建镜像内容
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/mirror
+          mkdir -p /tmp/mirror
+          cp -r src /tmp/mirror/src
+          mkdir -p /tmp/mirror/docs/screenshots
+          cp docs/screenshots/*.png /tmp/mirror/docs/screenshots/
+          cp mirror/README.md /tmp/mirror/README.md
+          cp mirror/LICENSE /tmp/mirror/LICENSE
+          printf 'node_modules/\ndist/\n*.log\n.DS_Store\n' > /tmp/mirror/.gitignore
+          # package.json 要裁剪：verify:* 那几条命令指向不同步的 scripts/ 目录，
+          # 留着就是给别人一条必然报错的命令。审计闸门有一条在守这件事。
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const keep = ["start", "pack", "dist"];
+            pkg.scripts = Object.fromEntries(Object.entries(pkg.scripts).filter(([k]) => keep.includes(k)));
+            delete pkg.devDependencies["playwright-core"];
+            pkg.repository = { type: "git", url: "https://github.com/supercubegame/todox-desktop.git" };
+            fs.writeFileSync("/tmp/mirror/package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          find /tmp/mirror -type f | sort
+
+      # 全新历史 + 强推。私有历史一旦推上去，等于什么都没隐藏,而公开仓的
+      # 文件树看起来会完全正确。审计闸门断言那边只有一个提交。
+      #
+      # 提交信息里带源 SHA，这是审计唯一能区分「同步成功」与「早就不同步了」
+      # 的凭据。别删。
+      - name: 强推到公开镜像
+        id: push
+        shell: bash
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd /tmp/mirror
+          git init -q -b main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "TodoX 源码镜像（源提交 ${GITHUB_SHA:0:7}）
+
+          这是一个只读镜像，历史被压成单个提交。改动请到开发仓提。"
+          git remote add origin "https://x-access-token:${MIRROR_TOKEN}@github.com/supercubegame/todox-desktop.git"
+          git push --force -q origin main
+          git log -1 --stat
+
+      # 审计读的是**公开仓服务端**那份，不是上面刚构建的暂存目录。
+      # continue-on-error 是为了让报告还能上传；job 在最后一步才真的失败。
+      # tee 一定要配 pipefail，否则管道退出码取 tee 的 0 —— 闸门红了 job 照样绿。
+      - name: 审计公开镜像
+        id: gate
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify-mirror.mjs 2>&1 | tee test/artifacts/stdout-mirror.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-mirror
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  summary:
+    name: 回报镜像结果
+    if: always()
+    needs: [sync]
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    with:
+      node-version: '20'
+      gates: '[{"name":"公开镜像同步","result":"${{ needs.sync.result }}"}]'
+      composer-files: scripts/compose-mirror-report.mjs scripts/lib/compose.mjs scripts/lib/report.mjs
+      composer-entry: scripts/compose-mirror-report.mjs
+      marker: '<!-- todox-mirror -->'
