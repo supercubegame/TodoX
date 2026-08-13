@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
-import { Report, GATES, RELEASE_GATES } from './lib/report.mjs';
+import { Report, GATES, RELEASE_GATES, SHOTS_GATES } from './lib/report.mjs';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -118,28 +118,21 @@ function sample() {
 }
 
 // ---------------------------------------------------------------- workflow 扫描器
-// 每个函数都吃 text 参数：所有流水线共用同一套扫描器。以前只扫 verify.yml，
+// 每个函数都吃 text 参数：三条流水线共用同一套扫描器。以前只扫 verify.yml，
 // 那样 release.yml 可以自由地长出一个没有 pipefail 的 tee 而没人看得见 ——
 // 模板级的修复不会自己跨文件传染。
 //
-// WF 是「有 summary 回写 job 的报告型流水线」，那几条关于 gates / 共享 workflow
-// 的断言只对它们成立。WF_ALL 多一个 screenshots，它没有回写 job，但**必须**一起
-// 被 pipefail 那条扫到。
-//
-// 而 WF_ALL 本身是手写的 —— 这就是漏继承的下一个藏身处：再加一份 workflow 而
-// 忘了登记，它就完全在扫描范围之外，可以自由长出假绿。所以下面有一条断言让
-// **目录本身成为期望**：实际存在的文件集合必须等于已登记集合。
+// 这张表是手写的，那就是漏继承的下一个藏身处：再加一份 workflow 而忘了登记，
+// 它就完全在扫描范围之外，可以自由长出假绿。所以下面有一条断言让**目录本身
+// 成为期望**：实际存在的文件集合必须等于这张表。
 const WF = {
   verify: { path: '.github/workflows/verify.yml', text: null },
-  release: { path: '.github/workflows/release.yml', text: null }
-};
-const WF_ALL = {
-  ...WF,
+  release: { path: '.github/workflows/release.yml', text: null },
   screenshots: { path: '.github/workflows/screenshots.yml', text: null }
 };
 function wf(key) {
-  if (WF_ALL[key].text == null) WF_ALL[key].text = readIfExists(WF_ALL[key].path);
-  return WF_ALL[key].text;
+  if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
+  return WF[key].text;
 }
 
 function onBlock(text) {
@@ -555,17 +548,17 @@ const CHECKS = [
     return `同一份内容，${a.length} 字节`;
   }],
 
-  // 这条是漏继承的解药。以前 WF 是手写的两项，于是**新加的 workflow 文件完全
+  // 这条是漏继承的解药。以前登记表是手写的两项，于是**新加的 workflow 文件完全
   // 在扫描范围之外**：它可以自由长出一个没有 pipefail 的 tee，而所有 run 依然
   // 全绿。手写清单永远追不上目录，所以让目录本身成为期望。
   ['CI：.github/workflows 下每一份 workflow 都被扫描器登记（目录即期望）', () => {
     const dir = path.join(ROOT, '.github', 'workflows');
     const actual = fs.readdirSync(dir).filter(n => /\.ya?ml$/.test(n)).sort();
     expectTrue(actual.length > 0, '一份 workflow 文件都没扫到 —— 是扫描器坏了，不是配置对了', `目录: ${dir}`);
-    const registered = Object.values(WF_ALL).map(w => path.basename(w.path)).sort();
+    const registered = Object.values(WF).map(w => path.basename(w.path)).sort();
     expectEq(actual, registered, '已登记的 workflow 集合');
-    // 登记了但文件不存在也要红，否则 wf() 会在别的断言里抛一个看不懂的错。
-    for (const key of Object.keys(WF_ALL)) expectTrue(wf(key).length > 0, `${WF_ALL[key].path} 是空文件`);
+    // 登记了但文件是空的也要红，否则 wf() 会在别的断言里抛一个看不懂的错。
+    for (const key of Object.keys(WF)) expectTrue(wf(key).length > 0, `${WF[key].path} 是空文件`);
     return `${actual.length} 份 workflow 全部在扫描范围内：${actual.join(', ')}`;
   }],
 
@@ -573,17 +566,17 @@ const CHECKS = [
     let totalRun = 0;
     let totalTee = 0;
     const bad = [];
-    for (const key of Object.keys(WF_ALL)) {
+    for (const key of Object.keys(WF)) {
       const blocks = runBlocks(wf(key));
-      expectTrue(blocks.length > 0, `${WF_ALL[key].path} 里一个 run: | 块都没扫到 —— 是扫描器坏了，不是配置对了`, wf(key).slice(0, 400));
+      expectTrue(blocks.length > 0, `${WF[key].path} 里一个 run: | 块都没扫到 —— 是扫描器坏了，不是配置对了`, wf(key).slice(0, 400));
       const tee = blocks.filter(b => b.body.includes('tee '));
-      expectTrue(tee.length > 0, `${WF_ALL[key].path} 里没有任何 tee 块 —— 那报告缺失时评论里就没有日志尾巴了`);
+      expectTrue(tee.length > 0, `${WF[key].path} 里没有任何 tee 块 —— 那报告缺失时评论里就没有日志尾巴了`);
       totalRun += blocks.length;
       totalTee += tee.length;
-      for (const b of tee) if (!b.body.includes('pipefail')) bad.push(`${WF_ALL[key].path} 第 ${b.line} 行的 run 块`);
+      for (const b of tee) if (!b.body.includes('pipefail')) bad.push(`${WF[key].path} 第 ${b.line} 行的 run 块`);
     }
     expectEq(bad, [], '缺 pipefail 的 tee 块');
-    return `${Object.keys(WF_ALL).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
+    return `${Object.keys(WF).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
   }],
 
   ['CI：report job 用共享 workflow，且没有自己长出 steps', () => {
@@ -591,12 +584,12 @@ const CHECKS = [
     for (const key of Object.keys(WF)) {
       const jobs = jobBlocks(wf(key));
       const j = jobs.get('summary');
-      expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job`, [...jobs.keys()].join(','));
+      expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job —— 送不出结论的闸门等于没跑`, [...jobs.keys()].join(','));
       if (!j.text.includes('uses: supercubegame/ci-workflows/.github/workflows/report.yml@main')) bad.push(`${WF[key].path} 没有引用共享回写 workflow`);
       if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
     }
     expectEq(bad, [], '回写 job 的问题');
-    return '两份报告型 workflow 都引用 ci-workflows/report.yml@main，本地零 steps';
+    return `${Object.keys(WF).length} 份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps`;
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
@@ -676,6 +669,19 @@ const CHECKS = [
     expectTrue(text.includes('[skip ci]'), '回写提交没有跳过 CI 的标记 —— 它推回同一条分支，会再次触发自己，无限循环', '截图不可能字节级复现，所以「没改动就不提交」拦不住这个循环');
     expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 600));
     return "只认 docs/** 与 shots/**，job 无条件执行，带 contents:write、[skip ci] 与「绿了才回写」三重守卫";
+  }],
+
+  // 另外两条流水线早就有「产物名与清单对齐」这条断言，截图这条没有 ——
+  // 那就是同一个漏继承又长了一遍。少了它，composer 会去找一个没人产出的 slug，
+  // 然后报告里只剩一句「没有产出报告」。
+  ['CI：screenshots 的产物名与 stdout 日志集合等于 SHOTS_GATES', () => {
+    const names = tokenSet(wf('screenshots'), RE_REPORT);
+    const wantNames = new Set(SHOTS_GATES.map(g => `report-${g.slug}`));
+    expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
+    const slugs = tokenSet(wf('screenshots'), RE_STDOUT);
+    const wantSlugs = new Set(SHOTS_GATES.map(g => g.slug));
+    expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
+    return `${names.size} 个产物 + ${slugs.size} 条日志，与 SHOTS_GATES 完全相等`;
   }],
 
   ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
