@@ -5,13 +5,17 @@
 // 这里回头去读公开仓**真实的树**,因为这件事最像成功的失败是「推上去了，
 // 但推的是错的东西」，而那从私有仓内部完全看不出来。
 //
-// 三类断言：
+// 四类断言：
 //   - 正向：该有的文件都在（README / LICENSE / src 里每个真实文件 / 三张截图）
 //   - 负向孪生：.github、scripts、test、AGENTS.md、CLAUDE.md 出现 0 次
 //     ,这一侧是整件事的全部意义。正向那侧在同步完全没生效时也会通过，
 //     因为公开仓上一次的内容还在那儿。
 //   - 历史：HEAD 只有一个提交。把私有历史一起推上去，等于什么都没隐藏,
 //     而文件树看起来会完全正确。
+//   - **正向痕迹：那个提交必须是本次同步产生的。** 这条差点被漏掉，而它
+//     是唯一能区分「同步成功」和「早就不同步了」的东西:推送失败时审计
+//     读到的是上一次留下的内容，前三类断言会全部通过。第一次运行会红
+//     （仓库是空的），之后就再也不会红。带时间戳的外部痕迹才承重。
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -24,6 +28,7 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
+const SRC_SHA = process.env.GITHUB_SHA || '';
 const report = new Report('公开镜像同步');
 
 const state = { tree: null, commits: null };
@@ -101,6 +106,22 @@ const CHECKS = [
     return `单个提交 ${state.commits[0].sha}：${state.commits[0].msg}`;
   }],
 
+  // 没有这一条，整个审计就是个假绿：推送失败时上面每一条都读的是上一次同步
+  // 留下的内容,文件树正确、负向断言通过、历史也只有一个提交。
+  ['公开仓上那个提交就是本次同步产生的（正向痕迹）', () => {
+    expectTrue(SRC_SHA !== '', '拿不到 GITHUB_SHA，无法确认镜像是否为本次同步', '这条断言在 CI 之外没有意义,不能当成通过');
+    const short = SRC_SHA.slice(0, 7);
+    const msg = state.commits[0].msg;
+    expectTrue(
+      msg.includes(short),
+      '公开仓上的提交不是本次同步产生的,镜像很可能早就停在旧内容上了',
+      `期望提交信息里含源 SHA ${short}\n实际提交信息: ${msg}\n` +
+      '「没有坏消息」和「早就不同步了」长得一模一样。推送真的失败时，上面每一条\n' +
+      '断言都会读到上一次留下的内容并全部通过 —— 只有这条会红。'
+    );
+    return `镜像提交信息含源 SHA ${short}，确认是这一次推上去的`;
+  }],
+
   ['截图不是空文件（验产物，不验路径存在）', () => {
     const shots = state.tree.filter(p => p.startsWith('docs/screenshots/') && p.endsWith('.png'));
     expectEq(shots.length, 3, '截图数量');
@@ -108,7 +129,7 @@ const CHECKS = [
     for (const p of shots) {
       const raw = gh(['api', `repos/${MIRROR_REPO}/contents/${p}`, '--jq', '.size'], `读取 ${p} 的体积`);
       const size = Number(String(raw).trim());
-      expectTrue(Number.isFinite(size) && size > 5000, `${p} 只有 ${size} 字节，像是空图`, `路径存在证明不了内容对,这里验的是服务端报的真实体积`);
+      expectTrue(Number.isFinite(size) && size > 5000, `${p} 只有 ${size} 字节，像是空图`, '路径存在证明不了内容对,这里验的是服务端报的真实体积');
       sizes.push(`${path.basename(p)} ${(size / 1024).toFixed(0)}KB`);
     }
     return sizes.join('，');
