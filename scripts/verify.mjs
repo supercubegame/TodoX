@@ -118,16 +118,28 @@ function sample() {
 }
 
 // ---------------------------------------------------------------- workflow 扫描器
-// 每个函数都吃 text 参数：两条流水线共用同一套扫描器。以前只扫 verify.yml，
+// 每个函数都吃 text 参数：所有流水线共用同一套扫描器。以前只扫 verify.yml，
 // 那样 release.yml 可以自由地长出一个没有 pipefail 的 tee 而没人看得见 ——
 // 模板级的修复不会自己跨文件传染。
+//
+// WF 是「有 summary 回写 job 的报告型流水线」，那几条关于 gates / 共享 workflow
+// 的断言只对它们成立。WF_ALL 多一个 screenshots，它没有回写 job，但**必须**一起
+// 被 pipefail 那条扫到。
+//
+// 而 WF_ALL 本身是手写的 —— 这就是漏继承的下一个藏身处：再加一份 workflow 而
+// 忘了登记，它就完全在扫描范围之外，可以自由长出假绿。所以下面有一条断言让
+// **目录本身成为期望**：实际存在的文件集合必须等于已登记集合。
 const WF = {
   verify: { path: '.github/workflows/verify.yml', text: null },
   release: { path: '.github/workflows/release.yml', text: null }
 };
+const WF_ALL = {
+  ...WF,
+  screenshots: { path: '.github/workflows/screenshots.yml', text: null }
+};
 function wf(key) {
-  if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
-  return WF[key].text;
+  if (WF_ALL[key].text == null) WF_ALL[key].text = readIfExists(WF_ALL[key].path);
+  return WF_ALL[key].text;
 }
 
 function onBlock(text) {
@@ -543,21 +555,35 @@ const CHECKS = [
     return `同一份内容，${a.length} 字节`;
   }],
 
+  // 这条是漏继承的解药。以前 WF 是手写的两项，于是**新加的 workflow 文件完全
+  // 在扫描范围之外**：它可以自由长出一个没有 pipefail 的 tee，而所有 run 依然
+  // 全绿。手写清单永远追不上目录，所以让目录本身成为期望。
+  ['CI：.github/workflows 下每一份 workflow 都被扫描器登记（目录即期望）', () => {
+    const dir = path.join(ROOT, '.github', 'workflows');
+    const actual = fs.readdirSync(dir).filter(n => /\.ya?ml$/.test(n)).sort();
+    expectTrue(actual.length > 0, '一份 workflow 文件都没扫到 —— 是扫描器坏了，不是配置对了', `目录: ${dir}`);
+    const registered = Object.values(WF_ALL).map(w => path.basename(w.path)).sort();
+    expectEq(actual, registered, '已登记的 workflow 集合');
+    // 登记了但文件不存在也要红，否则 wf() 会在别的断言里抛一个看不懂的错。
+    for (const key of Object.keys(WF_ALL)) expectTrue(wf(key).length > 0, `${WF_ALL[key].path} 是空文件`);
+    return `${actual.length} 份 workflow 全部在扫描范围内：${actual.join(', ')}`;
+  }],
+
   ['CI：所有 workflow 里出现 tee 的脚本块都设置了 pipefail', () => {
     let totalRun = 0;
     let totalTee = 0;
     const bad = [];
-    for (const key of Object.keys(WF)) {
+    for (const key of Object.keys(WF_ALL)) {
       const blocks = runBlocks(wf(key));
-      expectTrue(blocks.length > 0, `${WF[key].path} 里一个 run: | 块都没扫到 —— 是扫描器坏了，不是配置对了`, wf(key).slice(0, 400));
+      expectTrue(blocks.length > 0, `${WF_ALL[key].path} 里一个 run: | 块都没扫到 —— 是扫描器坏了，不是配置对了`, wf(key).slice(0, 400));
       const tee = blocks.filter(b => b.body.includes('tee '));
-      expectTrue(tee.length > 0, `${WF[key].path} 里没有任何 tee 块 —— 那报告缺失时评论里就没有日志尾巴了`);
+      expectTrue(tee.length > 0, `${WF_ALL[key].path} 里没有任何 tee 块 —— 那报告缺失时评论里就没有日志尾巴了`);
       totalRun += blocks.length;
       totalTee += tee.length;
-      for (const b of tee) if (!b.body.includes('pipefail')) bad.push(`${WF[key].path} 第 ${b.line} 行的 run 块`);
+      for (const b of tee) if (!b.body.includes('pipefail')) bad.push(`${WF_ALL[key].path} 第 ${b.line} 行的 run 块`);
     }
     expectEq(bad, [], '缺 pipefail 的 tee 块');
-    return `${Object.keys(WF).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
+    return `${Object.keys(WF_ALL).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
   }],
 
   ['CI：report job 用共享 workflow，且没有自己长出 steps', () => {
@@ -570,7 +596,7 @@ const CHECKS = [
       if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
     }
     expectEq(bad, [], '回写 job 的问题');
-    return '两份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps';
+    return '两份报告型 workflow 都引用 ci-workflows/report.yml@main，本地零 steps';
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
@@ -630,6 +656,26 @@ const CHECKS = [
     const vb = onBlock(wf('verify')).filter(l => l.includes('branches:')).map(l => l.trim());
     expectEq(vb, ["branches: ['**']"], 'verify.yml 的分支过滤');
     return "release 只认 release/**（不挂 main，不挂 **），verify 仍覆盖 ** —— 该跑不跑要红，不该跑却跑了也要红";
+  }],
+
+  // 截图 job 把 PNG 推回**同一条分支**，而这个 workflow 就挂在这条分支的 push 上。
+  // 提交信息里的跳过标记是唯一的循环终止条件 —— 截图不可能字节级复现，所以
+  // 「没有改动就不提交」在这里不成立。
+  ['CI：screenshots 的触发范围与回写循环守卫', () => {
+    const text = wf('screenshots');
+    const on = onBlock(text);
+    expectTrue(on.length > 0, 'screenshots.yml 里解析不到 on: 块 —— 扫描器坏了', text.slice(0, 300));
+    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
+    expectEq(branches, ["branches: ['docs/**', 'shots/**']"], 'screenshots.yml 的分支过滤');
+    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'screenshots.yml 没有手动触发的口子', on.join('\n'));
+    const jobs = jobBlocks(text);
+    expectTrue(jobs.has('shots'), 'screenshots.yml 里没有 shots job', [...jobs.keys()].join(','));
+    const j = jobs.get('shots');
+    expectEq(j.lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim()), [], 'shots job 上的 job 级 if');
+    expectTrue(j.text.includes('contents: write'), 'shots job 没有 contents: write，回写会直接失败', j.text.slice(0, 400));
+    expectTrue(text.includes('[skip ci]'), '回写提交没有跳过 CI 的标记 —— 它推回同一条分支，会再次触发自己，无限循环', '截图不可能字节级复现，所以「没改动就不提交」拦不住这个循环');
+    expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 600));
+    return "只认 docs/** 与 shots/**，job 无条件执行，带 contents:write、[skip ci] 与「绿了才回写」三重守卫";
   }],
 
   ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
