@@ -278,6 +278,11 @@ const RE_STDOUT = /stdout-([^\s`'"]+?)\.log/g;
 // 回写那行的引用。@ 后面必须是 40 位十六进制，不许是分支或 tag —— 见那条断言。
 const RE_WRITEBACK = /uses:\s*supercubegame\/ci-workflows\/\.github\/workflows\/report\.yml@([^\s]+)/g;
 
+// 从 AGENTS.md 拆到 docs/PITFALLS.md 的两节。它们的性质和别的不一样：随经验
+// 单调增长的档案，而 AGENTS.md 是每次都要读进上下文的指令。混在一起会让
+// 200 行上限反复顶格，然后有人去调宽它 —— 而调宽一条上限就是把断言改成装饰。
+const MOVED_SECTIONS = ['## 闸门红了先查夹具', '## 测不出来的'];
+
 // ---------------------------------------------------------------- 检查清单
 const report = new Report('快闸门（纯核心 + 静态断言）');
 
@@ -718,11 +723,33 @@ const CHECKS = [
     return `deb 在 target 里，maintainer=${maintainer || email}`;
   }],
 
-  ['文档：AGENTS.md 存在且不超过 200 行', () => {
-    const text = readIfExists('AGENTS.md');
-    const n = text.split('\n').length;
-    expectTrue(n <= 200, `AGENTS.md ${n} 行，超过 200 行上限`, '写长了模型会开始忽略里面的指令。这条上限只有断言守得住，写在文件里没用。');
-    return `${n} / 200 行`;
+  // 这条本来只数 AGENTS.md 的行数。它真的红过一次（202 行），而正确反应是压
+  // 措辞或拆文件,调宽上限等于把断言改成装饰。拆完之后它守的是整个拆分契约：
+  //
+  // 光断言「PITFALLS.md 存在」是空断言 —— **复制一份留两处同样会通过**，
+  // 然后两边开始分叉而没有任何东西看得见。所以负向那侧是承重的：那两节标题
+  // 必须**不在** AGENTS.md 里。只有它能区分「拆干净了」和「各留一份」。
+  ['文档：AGENTS.md ≤ 200 行，两节已挪进 PITFALLS 且没有留副本', () => {
+    const agents = readIfExists('AGENTS.md');
+    const n = agents.split('\n').length;
+    expectTrue(n <= 200, `AGENTS.md ${n} 行，超过 200 行上限`,
+      '写长了模型会开始忽略里面的指令。这条上限只有断言守得住，写在文件里没用。\n' +
+      '正确反应是压措辞或者把增长最快的那节挪去 docs/PITFALLS.md,**不是调宽上限**。');
+
+    // 档案那份：存在、不空、而且真的被引用。没人引用的档案没人会去读。
+    const pit = readIfExists('docs/PITFALLS.md');
+    const pitLines = pit.split('\n').length;
+    expectTrue(pitLines >= 40, `docs/PITFALLS.md 只有 ${pitLines} 行，像是没真的搬过去`, pit.slice(0, 300));
+    expectTrue(agents.includes('docs/PITFALLS.md'), 'AGENTS.md 里没有引用 docs/PITFALLS.md',
+      '拆出去而不留指路牌，等于把那份档案藏起来了。');
+
+    // 正反两侧：标题在档案里，且**不在**指令里。
+    for (const h of MOVED_SECTIONS) {
+      expectTrue(pit.includes(h), `docs/PITFALLS.md 里找不到「${h}」`, '这节应该被挪过去了');
+      expectTrue(!agents.includes(h), `AGENTS.md 里还留着「${h}」`,
+        '两处各留一份会各自长歪，而没有任何断言看得见 —— 这条负向就是为这件事写的。');
+    }
+    return `AGENTS.md ${n} / 200 行（余 ${200 - n}）｜PITFALLS ${pitLines} 行，${MOVED_SECTIONS.length} 节正反两侧都对`;
   }],
 
   ['文档：AGENTS.md 与 CLAUDE.md 逐字节相同', () => {
@@ -933,9 +960,9 @@ const CHECKS = [
   // 截图 job 把 PNG 推回**同一条分支**，而这个 workflow 就挂在这条分支的 push 上，
   // 所以必须有一个终止条件。
   //
-  // 那个条件原来是提交信息里的 `[skip ci]`,**一个字符串**。谁改一次提交信息
-  // 模板，流水线就开始自触发，而且没有任何东西会喊。现在换成身份判断：触发
-  // 本次运行的那个提交，committer 邮箱不许是回写自己配的那个。
+  // 那个条件原来是提交信息里的字符串。谁改一次提交信息模板，流水线就开始
+  // 自触发，而且没有任何东西会喊。现在换成身份判断：触发本次运行的那个提交，
+  // committer 邮箱不许是回写自己配的那个。
   //
   // 两处邮箱是一组耦合参数，下面真的去比。改一处不改另一处，守卫会哑 ——
   // 而哑掉的表现是自触发循环，不是红。
@@ -968,11 +995,13 @@ const CHECKS = [
     expectTrue(text.includes("github.actor != 'github-actions[bot]'"), '缺第二层 actor 守卫', j.text.slice(0, 800));
     expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 800));
 
-    // 负向那侧：不许退回字符串守卫。留着 [skip ci] 会让上面两层永远走不到，
+    // 负向那侧：不许退回字符串守卫。留着那个跳过标记会让上面两层永远走不到，
     // 那就没法区分「它在守」和「它是空的」—— 和空断言是同一个形状。
-    expectTrue(!text.includes('[skip ci]'), '`[skip ci]` 回来了',
-      '留着它身份守卫永远走不到，于是没法区分「它在守」和「它是空的」。这条守卫已经改成身份判断，字符串那条要删干净。');
-    return `只认 docs/** 与 shots/**，job 无条件执行；守卫 = 闸门绿 + committer 不是 ${email} + actor 不是 bot（两处邮箱逐字相同），已无 [skip ci]`;
+    // 模式用拼接构造，否则这条扫描会抓到自己（而那时说谎的是夹具）。
+    const SKIP_MARK = ['[skip', ' ci]'].join('');
+    expectTrue(!text.includes(SKIP_MARK), '那个提交信息里的跳过标记回来了',
+      '留着它身份守卫永远走不到，于是没法区分「它在守」和「它是空的」。守卫已经改成身份判断，字符串那条要删干净。');
+    return `只认 docs/** 与 shots/**，job 无条件执行；守卫 = 闸门绿 + committer 不是 ${email} + actor 不是 bot（两处邮箱逐字相同），字符串守卫已删净`;
   }],
 
   // 另外两条流水线早就有「产物名与清单对齐」这条断言，截图这条没有 ——
