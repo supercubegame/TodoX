@@ -67,6 +67,9 @@ function walk(dir, out = []) {
   }
   return out;
 }
+// 正则转义。把从配置里读出来的字面量拼进正则之前必须过一遍，否则邮箱里的 `.`
+// 和 `+` 会变成元字符 —— 那样断言会在一个「看起来匹配了」的地方悄悄放宽。
+function reEscape(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 // 密钥扫描只看文本文件。截图进仓库之后，二进制里凑巧出现一段密钥形状的字节
 // 就会给出一条谁也看不懂的偶发红 —— 而它防的东西（把密钥藏进 PNG）不现实。
 const BINARY_EXT = ['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.zip', '.asar', '.icns'];
@@ -171,8 +174,8 @@ function wf(key) {
   if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
   return WF[key].text;
 }
-// 剥掉注释的那份，给「集合相等」类断言用。**剥完先自证**：剥成空字符串的话，
-// 后面每条集合断言都会免费通过（空集合等于空集合）。
+// 剥掉注释的那份，给「集合相等」和「配置里有没有 X」类断言用。
+// **剥完先自证**：剥成空字符串的话，后面每条集合断言都会免费通过（空集合等于空集合）。
 function bare(key) {
   if (WF[key].bare == null) {
     const stripped = stripYamlComments(wf(key));
@@ -927,13 +930,19 @@ const CHECKS = [
     return "release 只认 release/**（不挂 main，不挂 **），verify 仍覆盖 ** —— 该跑不跑要红，不该跑却跑了也要红";
   }],
 
-  // 截图 job 把 PNG 推回**同一条分支**，而这个 workflow 就挂在这条分支的 push 上。
-  // 提交信息里的跳过标记是唯一的循环终止条件 —— 截图不可能字节级复现，所以
-  // 「没有改动就不提交」在这里不成立。
-  ['CI：screenshots 的触发范围与回写循环守卫', () => {
-    const text = wf('screenshots');
-    const on = onBlock(text);
-    expectTrue(on.length > 0, 'screenshots.yml 里解析不到 on: 块 —— 扫描器坏了', text.slice(0, 300));
+  // 截图 job 把 PNG 推回**同一条分支**，而这个 workflow 就挂在这条分支的 push 上，
+  // 所以必须有一个终止条件。
+  //
+  // 那个条件原来是提交信息里的 `[skip ci]`,**一个字符串**。谁改一次提交信息
+  // 模板，流水线就开始自触发，而且没有任何东西会喊。现在换成身份判断：触发
+  // 本次运行的那个提交，committer 邮箱不许是回写自己配的那个。
+  //
+  // 两处邮箱是一组耦合参数，下面真的去比。改一处不改另一处，守卫会哑 ——
+  // 而哑掉的表现是自触发循环，不是红。
+  ['CI：screenshots 的触发范围与回写循环守卫（身份判断，不是提交信息字符串）', () => {
+    const text = bare('screenshots');
+    const on = onBlock(wf('screenshots'));
+    expectTrue(on.length > 0, 'screenshots.yml 里解析不到 on: 块 —— 扫描器坏了', wf('screenshots').slice(0, 300));
     const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
     expectEq(branches, ["branches: ['docs/**', 'shots/**']"], 'screenshots.yml 的分支过滤');
     expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'screenshots.yml 没有手动触发的口子', on.join('\n'));
@@ -942,9 +951,28 @@ const CHECKS = [
     const j = jobs.get('shots');
     expectEq(jobLevelIfs(j), [], 'shots job 上的 job 级 if');
     expectTrue(j.text.includes('contents: write'), 'shots job 没有 contents: write，回写会直接失败', j.text.slice(0, 400));
-    expectTrue(text.includes('[skip ci]'), '回写提交没有跳过 CI 的标记 —— 它推回同一条分支，会再次触发自己，无限循环', '截图不可能字节级复现，所以「没改动就不提交」拦不住这个循环');
-    expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 600));
-    return "只认 docs/** 与 shots/**，job 无条件执行，带 contents:write、[skip ci] 与「绿了才回写」三重守卫";
+
+    // 回写用的身份从 git config 那行读出来 —— 它是唯一的事实来源。
+    const configured = /git config user\.email '([^']+)'/.exec(text);
+    expectTrue(Boolean(configured), '扫不到回写步骤里配置的 committer 邮箱 —— 是扫描器坏了，不是配置对了', j.text.slice(0, 600));
+    const email = configured[1];
+    expectTrue(email.includes('@'), '回写配置的 committer 邮箱不是邮箱形状', email);
+
+    // 守卫必须拿**同一个**邮箱去比。拼进正则前先转义：邮箱里的 . 和 + 是元字符，
+    // 不转义的话这条断言会在一个「看起来匹配了」的地方悄悄放宽。
+    const guard = new RegExp(`head_commit\\.committer\\.email\\s*!=\\s*'${reEscape(email)}'`);
+    expectTrue(guard.test(text), '回写守卫比较的邮箱与 git config 配的那个不一致',
+      `git config 配的是 ${email}\n两处必须逐字相同，否则守卫会哑 —— 而哑掉的表现是自触发循环，不是红。`);
+    // 第二层。它只在用 GITHUB_TOKEN 时有效（PAT 推送时 actor 是 PAT 的主人），
+    // 所以它是补充，不是主力 —— 主力是上面那条与令牌无关的 committer 判断。
+    expectTrue(text.includes("github.actor != 'github-actions[bot]'"), '缺第二层 actor 守卫', j.text.slice(0, 800));
+    expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 800));
+
+    // 负向那侧：不许退回字符串守卫。留着 [skip ci] 会让上面两层永远走不到，
+    // 那就没法区分「它在守」和「它是空的」—— 和空断言是同一个形状。
+    expectTrue(!text.includes('[skip ci]'), '`[skip ci]` 回来了',
+      '留着它身份守卫永远走不到，于是没法区分「它在守」和「它是空的」。这条守卫已经改成身份判断，字符串那条要删干净。');
+    return `只认 docs/** 与 shots/**，job 无条件执行；守卫 = 闸门绿 + committer 不是 ${email} + actor 不是 bot（两处邮箱逐字相同），已无 [skip ci]`;
   }],
 
   // 另外两条流水线早就有「产物名与清单对齐」这条断言，截图这条没有 ——
