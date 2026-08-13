@@ -172,6 +172,11 @@ function jobBlocks(text) {
   return jobs;
 }
 
+// job 级 if 只出现在缩进 4 空格的位置。step 级的 if 缩进更深，不算。
+function jobLevelIfs(job) {
+  return job.lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim());
+}
+
 function runBlocks(text) {
   const lines = text.split('\n');
   const blocks = [];
@@ -656,7 +661,7 @@ const CHECKS = [
     const offenders = [];
     for (const [name, j] of jobs) {
       if (name === 'summary') continue;
-      for (const l of j.lines) if (/^ {4}if:/.test(l)) offenders.push(`${name}: ${l.trim()}`);
+      for (const l of jobLevelIfs(j)) offenders.push(`${name}: ${l}`);
     }
     expectEq(offenders, [], '带 job 级 if 的闸门 job');
     expectTrue(jobs.size >= 4, 'job 数量少于预期', [...jobs.keys()].join(','));
@@ -690,7 +695,7 @@ const CHECKS = [
     const jobs = jobBlocks(text);
     expectTrue(jobs.has('shots'), 'screenshots.yml 里没有 shots job', [...jobs.keys()].join(','));
     const j = jobs.get('shots');
-    expectEq(j.lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim()), [], 'shots job 上的 job 级 if');
+    expectEq(jobLevelIfs(j), [], 'shots job 上的 job 级 if');
     expectTrue(j.text.includes('contents: write'), 'shots job 没有 contents: write，回写会直接失败', j.text.slice(0, 400));
     expectTrue(text.includes('[skip ci]'), '回写提交没有跳过 CI 的标记 —— 它推回同一条分支，会再次触发自己，无限循环', '截图不可能字节级复现，所以「没改动就不提交」拦不住这个循环');
     expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 600));
@@ -722,7 +727,7 @@ const CHECKS = [
     expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'mirror.yml 没有手动触发的口子', on.join('\n'));
     const jobs = jobBlocks(text);
     expectTrue(jobs.has('sync'), 'mirror.yml 里没有 sync job', [...jobs.keys()].join(','));
-    expectEq(jobs.get('sync').lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim()), [], 'sync job 上的 job 级 if');
+    expectEq(jobLevelIfs(jobs.get('sync')), [], 'sync job 上的 job 级 if');
     // 令牌缺失必须 exit 1。静默跳过和「同步成功」在面板上长得一模一样。
     expectTrue(text.includes('MIRROR_TOKEN:-') && text.includes('exit 1'), 'mirror.yml 没有在令牌缺失时明确失败', '静默跳过就等于「以为同步了，其实什么都没发生」');
     expectTrue(text.includes('git push --force'), 'mirror.yml 不是强推 —— 公开仓可能留下私有历史', text.slice(0, 400));
@@ -754,21 +759,31 @@ const CHECKS = [
     return `${names.size} 个产物 + ${slugs.size} 条日志，与 RELEASE_GATES 完全相等`;
   }],
 
-  ['CI：release 的校验与回写带 if: always()，构建与发布无条件执行', () => {
+  // 这条原来手写着 ['dist','publish','verify','summary'] 四个 job 名。加
+  // mirror job 的时候它完全在检查范围之外 —— 和「新加的 workflow 没登记」
+  // 是同一个形状，一小时内长了第二遍。所以改成枚举即期望：
+  // release.yml 里**每一个** job 都必须落进这两类之一。
+  ['CI：release 的每个 job 要么无条件执行，要么显式 always()（枚举即期望）', () => {
     const jobs = jobBlocks(wf('release'));
-    for (const n of ['dist', 'publish', 'verify', 'summary']) {
-      expectTrue(jobs.has(n), `release.yml 里没有 ${n} job`, [...jobs.keys()].join(','));
-    }
-    const anyIf = n => jobs.get(n).lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim());
-    const alwaysIf = n => anyIf(n).some(l => /^if:\s*always\(\)$/.test(l));
+    expectTrue(jobs.size >= 5, 'release.yml 的 job 数量少于预期 —— 是扫描器坏了，不是配置对了', [...jobs.keys()].join(','));
     // 这两个必须 always：上游炸了它们也要跑，然后如实报「读不到 Release」。
     // 静默跳过和「验过了没问题」在面板上长得一模一样。
-    expectTrue(alwaysIf('verify'), 'verify job 没有 if: always()，上游失败时它会被静默跳过', anyIf('verify').join('\n') || '（没有任何 if）');
-    expectTrue(alwaysIf('summary'), 'summary job 没有 if: always()', anyIf('summary').join('\n') || '（没有任何 if）');
-    // 这两个不许有条件：写歪了会让整条发布静默永不执行，而 run 依然全绿。
-    expectEq(anyIf('dist'), [], 'dist job 上的 job 级 if');
-    expectEq(anyIf('publish'), [], 'publish job 上的 job 级 if');
-    return 'verify / summary 带 always()，dist / publish 无条件 —— 四个方向都断言过';
+    const ALWAYS = ['verify', 'summary'];
+    for (const n of ALWAYS) expectTrue(jobs.has(n), `release.yml 里没有 ${n} job`, [...jobs.keys()].join(','));
+    const problems = [];
+    for (const [name, j] of jobs) {
+      const ifs = jobLevelIfs(j);
+      if (ALWAYS.includes(name)) {
+        // 负向那侧：名单里的 job 丢了 always() 也要红。
+        if (!ifs.some(l => /^if:\s*always\(\)$/.test(l))) problems.push(`${name} 应该带 if: always()，实际：${ifs.join(' / ') || '（没有任何 if）'}`);
+      } else if (ifs.length > 0) {
+        // 其余 job 一律不许有条件：写歪了会让它静默永不执行，而 run 依然全绿。
+        problems.push(`${name} 不该有 job 级 if，实际：${ifs.join(' / ')}`);
+      }
+    }
+    expectEq(problems, [], 'job 条件的问题');
+    const plain = [...jobs.keys()].filter(n => !ALWAYS.includes(n));
+    return `${jobs.size} 个 job：${plain.join(' / ')} 无条件执行，${ALWAYS.join(' / ')} 带 always() —— 新加 job 会自动落进这条断言`;
   }],
 
   ['密钥：哨兵在源码与报告里出现 0 次（负向）', () => {
