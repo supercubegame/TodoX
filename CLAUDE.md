@@ -18,6 +18,10 @@ Electron 三平台待办事项应用。改完任何东西，**必须跑闸门**�
 6. **发布分支上的改动必须回流 main。** 已经犯过两次，现在有断言在守（见下）。
 7. **shell 里文件名一律加引号或用 `-print0`。** 犯过一次：`TodoX Setup 1.0.2.exe`
    被词分割，上传整体失败，而症状是「对面一个资产都没有」。
+8. **共享回写只许钉在 40 位 SHA 上，四份 workflow 钉同一个。** `@main` 是可变
+   引用：上游改一行就会悄悄改掉四条流水线的行为，而回写坏掉的表现是「闸门
+   全绿但没人看得到结论」。上游有值得跟的改动时手动 bump 并读一遍 diff,
+   这是有意的摩擦。快闸门有断言在守，只更新一半也红。
 
 ## 结构
 
@@ -29,13 +33,14 @@ src/main/persist.js     原子落盘
 src/preload/preload.js  contextBridge 暴露的 window.todox
 src/renderer/           界面。只渲染 + 发意图，不持有业务规则
 mirror/                 公开镜像用的 README 与 LICENSE（不参与应用构建）
-scripts/verify.mjs      快闸门：纯核心 + 静态不变量 + 四份 workflow 自审（57 条）
+scripts/verify.mjs      快闸门：纯核心 + 静态不变量 + 四份 workflow 自审（58 条）
 scripts/verify-e2e.mjs  端到端闸门：真起 Electron，真操作，真断言（21 条）
 scripts/verify-perf.mjs 性能压测闸门：稳态延迟 / 规模比值 / 堆增长（11 条）
 scripts/verify-pack.mjs 打包闸门：三平台各打一次 --dir（每平台 4 条）
 scripts/verify-dist.mjs 安装包闸门：三平台各打真安装包（每平台 6 条）
 scripts/verify-release.mjs 发布资产校验：把 Release 从 API 读回来（6 条）
 scripts/verify-release-mirror.mjs 公开仓 Release 同步校验，逐个比 sha256（8 条）
+scripts/attest-comment.mjs 回写送达核对：报告写完之后回头找那条评论（7 条）
 scripts/shoot.mjs       截图生成器：真起 Electron 截 README 用的图（8 条）
 scripts/verify-mirror.mjs 镜像审计 + 版本回流：读公开仓真实的树（10 条）
 scripts/lib/compose.mjs 报告合成，四条流水线共用
@@ -44,7 +49,8 @@ scripts/lib/mirror.mjs  公开镜像的路径白名单与黑名单，唯一一�
 
 ## 四条流水线
 
-- `verify.yml` — 任何分支推送都跑。快闸门 + 端到端 + 性能压测 + 三平台打包。
+- `verify.yml` — 任何分支推送都跑。快闸门 + 端到端 + 性能压测 + 三平台打包，
+  报告写完之后再跑一个 **attest**（回写送达核对）。
 - `release.yml` — **只在 `release/**` 上跑**。三平台打真安装包 → 建 Release →
   读回来校验 → 同步到公开仓（先草稿，审计过了才转正）。发版就是推一个
   `release/vX.Y.Z` 分支并把 `version` 改成对应号。
@@ -65,6 +71,8 @@ npm run verify:pack 打包闸门（需要 TODOX_PACK_SLUG=pack-linux|pack-mac|pa
 npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac|dist-win）
 ```
 
+`attest-comment.mjs` 只在 CI 里有意义：它要读本次 run 的 id 和 token。
+
 ## 相互耦合的参数：改一个必须重算另一个
 
 - **最小窗口尺寸 480x360** ↔ 端到端闸门里 `getMinimumSize()` 的期望值
@@ -84,12 +92,18 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
   校准系数（先跑一段确定的参考负载量机器速度，**只放大不收紧**，放大到 8 倍
   还兜不住就宣布「本次测量不可信」并红）。主力断言是比值：`N` → `BIG` 数据量
   翻 4 倍，耗时不许超过 `scaleRatio = 6` 倍。改 `N` / `BIG` 的比例必须重算这个数。
-  写成绝对毫秒会在共享 runner 上变成随机红，然后被一路调宽到永远不会红。
+- **`marker`（`<!-- todox-verify -->`）出现在两处**：`verify.yml` 里 summary 的输入，
+  以及 `attest-comment.mjs` 里那个常量。改一处不改另一处，核对会去找一个没人
+  写的 marker,症状看起来像「评论没送达」，根因其实在这里。快闸门逐字比两处。
+- **被钉住的回写 SHA** ↔ 四份 workflow。快闸门断言那个集合大小恰好为 1,
+  只更新一半比全钉 `@main` 更糟：行为分叉而没有任何断言看得见。
 - **`scripts/manifest.json` 的条数** ↔ 各闸门里 `CHECKS` / `STEPS` 数组长度。
   这是等号断言，不是下限 —— 下限会自己漂，加一条少一条都不会红。
 - **`GATES` / `RELEASE_GATES` / `SHOTS_GATES` / `MIRROR_GATES`** ↔ 四份 workflow 里的
   `stdout-<slug>.log` 与 `report-<slug>` 产物名。快闸门断言这些集合完全相等，
   性能闸门再加一层：每条闸门 job 必须**真的执行了对应的闸门脚本**。
+  **attest 不在 GATES 里**（它跑在报告写完之后），所以它的日志叫 `attest.log`、
+  产物叫 `attest-log`,占用那两个命名空间会让上面那几条断言红在命名上。
 - **发布资产数量 8**（Linux 2 + macOS 4 + Windows 2）出现在四处：
   `verify-dist.mjs` 的 `PLAN[*].count`、`verify-release.mjs` 的 `EXPECT_TOTAL`、
   `verify-release-mirror.mjs` 的 `EXPECT_TOTAL`、`release.yml` 的「发布前清点资产」。
@@ -122,15 +136,18 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
 - 密钥扫描只看文本文件。把 PNG 也扫进去会给出偶发的、谁也看不懂的红。
 - **性能数字先看校准那条。** 时间类断言红了先问「这台机器这次是不是特别慢」，
   校准系数写在报告第一行；比值类断言红了才大概是真的复杂度退化。
+- **attest 红了先分清两件事**：是评论真的没送达（去看 summary 那个 job），
+  还是 marker 两处不一致（快闸门那条会同时红，先看它）。
 - **改了流程顺序，先问一句「审计还找得到它吗」。** 犯过一次：把发布改成草稿
   优先，而按 tag 查询对草稿返回 404（草稿没有 tag ref），审计当场读不到。
 
 ## 读外部系统的审计，必须有正向痕迹
 
-发布资产校验和镜像审计都是「回头去读服务端那份」。这类审计有个共同的假绿：
-**推送失败时读到的是上一次留下的内容，于是每一条断言都通过。** 所以两边都要有
-一条断言把结果钉在**本次**运行上（镜像那条是「提交信息里含本次 `GITHUB_SHA`」，
-发布那条是「逐个比 sha256」）。带时间戳或内容摘要的痕迹才承重。
+发布资产校验、镜像审计、回写送达核对都是「回头去读服务端那份」。这类审计有个
+共同的假绿：**推送失败时读到的是上一次留下的内容，于是每一条断言都通过。**
+所以每一边都要有一条断言把结果钉在**本次**运行上（镜像那条是「提交信息里含本次
+`GITHUB_SHA`」，发布那条是「逐个比 sha256」，回写那条是「评论正文里含本次短 SHA
+与 run id」）。带时间戳或内容摘要的痕迹才承重。
 
 **半成品要做成看得见的失败态**：先建草稿，审计过了才转正。犯过一次相反的，
 结果留下一个「谁都看得见但零个文件」的发布。
@@ -144,6 +161,10 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
 
 - **界面好不好看、顺不顺手**，机器判断不了。闸门只能证明「画出来了、点得动、
   数据对」，不能证明「好用」。
+- **共享回写自己的行为对不对。** 这里现在守住了两半：静态那半（钉在 SHA、
+  marker 两处一致、attest job 还在）和运行时那半（评论真的送达且钉在本次）。
+  剩下真正管不着的是**上游那份文件内部的逻辑**,那只有 `ci-workflows` 自己的
+  自检负责。这边能做的只是「钉住 + 事后核对结果」。
 - **macOS 与 Windows 上的真实观感与原生行为**（菜单、Dock、任务栏、高 DPI）。
   CI 只验证「能打出包、体积合理、Release 上真的有这个文件」，行为验收得在真机上做。
 - **安装包没有签名，装机流程验不了。** macOS Gatekeeper 与 Windows SmartScreen
