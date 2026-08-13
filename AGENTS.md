@@ -31,6 +31,7 @@ src/renderer/           界面。只渲染 + 发意图，不持有业务规则
 mirror/                 公开镜像用的 README 与 LICENSE（不参与应用构建）
 scripts/verify.mjs      快闸门：纯核心 + 静态不变量 + 四份 workflow 自审（57 条）
 scripts/verify-e2e.mjs  端到端闸门：真起 Electron，真操作，真断言（21 条）
+scripts/verify-perf.mjs 性能压测闸门：稳态延迟 / 规模比值 / 堆增长（11 条）
 scripts/verify-pack.mjs 打包闸门：三平台各打一次 --dir（每平台 4 条）
 scripts/verify-dist.mjs 安装包闸门：三平台各打真安装包（每平台 6 条）
 scripts/verify-release.mjs 发布资产校验：把 Release 从 API 读回来（6 条）
@@ -43,7 +44,7 @@ scripts/lib/mirror.mjs  公开镜像的路径白名单与黑名单，唯一一�
 
 ## 四条流水线
 
-- `verify.yml` — 任何分支推送都跑。快闸门 + 端到端 + 三平台打包。
+- `verify.yml` — 任何分支推送都跑。快闸门 + 端到端 + 性能压测 + 三平台打包。
 - `release.yml` — **只在 `release/**` 上跑**。三平台打真安装包 → 建 Release →
   读回来校验 → 同步到公开仓（先草稿，审计过了才转正）。发版就是推一个
   `release/vX.Y.Z` 分支并把 `version` 改成对应号。
@@ -59,6 +60,7 @@ scripts/lib/mirror.mjs  公开镜像的路径白名单与黑名单，唯一一�
 npm start           本地跑起来
 npm run verify      快闸门（几十秒，零依赖，每次改动都要跑）
 npm run verify:e2e  端到端闸门（需要 npm install；Linux 上用 xvfb-run）
+npm run verify:perf 性能压测闸门（零依赖；脚本会自己带 --expose-gc 重启一遍）
 npm run verify:pack 打包闸门（需要 TODOX_PACK_SLUG=pack-linux|pack-mac|pack-win）
 npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac|dist-win）
 ```
@@ -75,13 +77,19 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
   必须重新实测这个数，否则「探针像素 == 行数 x 164」会红在尺子上。
 - **fontScale 上下限 80/160** ↔ 滑条的 `min`/`max`/`step` ↔ 闸门里逐格按到 160。
   改 step 就要改按键序列。
-- **`HISTORY_LIMIT = 50`** ↔ 快闸门那条「上限真的可达」的断言（它推 51 次去撞）。
-  历史**不进存档**：有两条断言在守（serialize 顶层只有 4 个字段）。改上限要重算
-  那条断言的循环次数。
+- **`HISTORY_LIMIT = 50`** ↔ 快闸门那条「上限真的可达」的断言（它推 51 次去撞）
+  ↔ 性能闸门那条「50 层堆增长有上限」。历史**不进存档**：有两条断言在守
+  （serialize 顶层只有 4 个字段）。改上限要重算那两条断言的循环次数。
+- **性能预算是相对值，不是绝对毫秒。** `verify-perf.mjs` 的时间预算会乘上一个
+  校准系数（先跑一段确定的参考负载量机器速度，**只放大不收紧**，放大到 8 倍
+  还兜不住就宣布「本次测量不可信」并红）。主力断言是比值：`N` → `BIG` 数据量
+  翻 4 倍，耗时不许超过 `scaleRatio = 6` 倍。改 `N` / `BIG` 的比例必须重算这个数。
+  写成绝对毫秒会在共享 runner 上变成随机红，然后被一路调宽到永远不会红。
 - **`scripts/manifest.json` 的条数** ↔ 各闸门里 `CHECKS` / `STEPS` 数组长度。
   这是等号断言，不是下限 —— 下限会自己漂，加一条少一条都不会红。
 - **`GATES` / `RELEASE_GATES` / `SHOTS_GATES` / `MIRROR_GATES`** ↔ 四份 workflow 里的
-  `stdout-<slug>.log` 与 `report-<slug>` 产物名。快闸门断言这些集合完全相等。
+  `stdout-<slug>.log` 与 `report-<slug>` 产物名。快闸门断言这些集合完全相等，
+  性能闸门再加一层：每条闸门 job 必须**真的执行了对应的闸门脚本**。
 - **发布资产数量 8**（Linux 2 + macOS 4 + Windows 2）出现在四处：
   `verify-dist.mjs` 的 `PLAN[*].count`、`verify-release.mjs` 的 `EXPECT_TOTAL`、
   `verify-release-mirror.mjs` 的 `EXPECT_TOTAL`、`release.yml` 的「发布前清点资产」。
@@ -112,6 +120,8 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
 - 后台窗口会被节流。夹具在操作前显式 `show()` + `focus()`。
 - 静态扫描前先证明解析成功。剥注释剥成空字符串的话，后面每条断言都会免费通过。
 - 密钥扫描只看文本文件。把 PNG 也扫进去会给出偶发的、谁也看不懂的红。
+- **性能数字先看校准那条。** 时间类断言红了先问「这台机器这次是不是特别慢」，
+  校准系数写在报告第一行；比值类断言红了才大概是真的复杂度退化。
 - **改了流程顺序，先问一句「审计还找得到它吗」。** 犯过一次：把发布改成草稿
   优先，而按 tag 查询对草稿返回 404（草稿没有 tag ref），审计当场读不到。
 
@@ -139,6 +149,9 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
 - **安装包没有签名，装机流程验不了。** macOS Gatekeeper 与 Windows SmartScreen
   的拦截行为、以及绕过之后能不能正常启动，只有真机点得出来。
 - **`.deb` 在各发行版上的依赖解析**、AppImage 在没有 FUSE 的机器上的表现。
+- **绝对的性能数字。** 共享 runner 的抖动能到好几倍，性能闸门只能证明「复杂度
+  没退化、稳态延迟还在同一个量级」，证明不了「在用户那台机器上有多快」。渲染
+  进程的帧率、启动时间同样没有断言在看。
 - **撤销在真实使用里够不够用**。50 步是猜的，不是实测的；「用户什么时候会想
   撤销更久以前的东西」机器判断不了。跨重启的撤销是有意不做的，不是漏了。
 - **截图的「好看」程度**。像素计数与字形签名能证明「颜色对、字画出来了」，
