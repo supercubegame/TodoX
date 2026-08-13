@@ -3,7 +3,10 @@
   "productName": "TodoX",
   "version": "1.0.0",
   "description": "TodoX - 跨平台待办事项应用（Electron）",
-  "author": "supercubegame",
+  "author": {
+    "name": "supercubegame",
+    "email": "147731548+supercubegame@users.noreply.github.com"
+  },
   "license": "MIT",
   "main": "src/main/main.js",
   "scripts": {
@@ -28,6 +31,10 @@
     "files": ["src/**/*", "package.json"],
     "win": { "target": ["nsis", "zip"] },
     "mac": { "target": ["dmg", "zip"], "category": "public.app-category.productivity" },
-    "linux": { "target": ["AppImage", "deb"], "category": "Utility" }
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Utility",
+      "maintainer": "supercubegame <147731548+supercubegame@users.noreply.github.com>"
+    }
   }
 }

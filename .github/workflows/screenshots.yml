@@ -1,0 +1,111 @@
+name: screenshots
+
+# 只在文档类分支上跑。这是个有意的条件触发，所以快闸门里有一条断言逐字核对
+# 下面的 branches 行 —— 写歪之后这个 job 会静默永不执行，而所有 run 依然全绿，
+# 我会以为「截图流水线跑过了，只是没产出」。
+on:
+  push:
+    branches: ['docs/**', 'shots/**']
+  workflow_dispatch:
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shots:
+    name: 生成截图
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 缓存 Electron 下载
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+      # fonts-noto-cjk 是承重的，别删：ubuntu runner 默认不带任何中日韩字体，
+      # 缺了它界面上每个汉字都会渲染成豆腐块，而截图闸门其余的断言（探针像素、
+      # 背景色、体积、sha 互不相同）全都照样通过 —— 实测过一次 7/7 全绿而三张图
+      # 全是方块。
+      #
+      # 守这一行的**不是**一条静态断言（那只能证明配置文件里有这行字），而是
+      # shoot.mjs 里那条字形断言：它拿 U+E000 当豆腐块基准，真的去比中文字形的
+      # 位图签名。字体没装上，它就红。
+      - name: 装系统依赖与中日韩字体
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1
+          sudo apt-get install -y fonts-noto-cjk fonts-noto-color-emoji
+          fc-list :lang=zh | head -n 5
+      - name: 装依赖
+        run: npm install --no-audit --no-fund
+      # xvfb 默认 8 位色深，那会让「背景色等于主题令牌」和「探针像素个数」
+      # 两条断言一起变成掷骰子。显式要 24 位。
+      #
+      # continue-on-error 是为了让报告还能上传；job 在最后一步才真的失败。
+      # tee 一定要配 pipefail，否则管道退出码取 tee 的 0 —— 闸门红了 job 照样绿。
+      - name: 生成截图
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts docs/screenshots
+          xvfb-run -a --server-args="-screen 0 1600x1200x24" node scripts/shoot.mjs 2>&1 | tee test/artifacts/stdout-shots.log
+      # 报告和截图一起传。产物名必须是 report-shots：composer 按 SHOTS_GATES
+      # 去找 report-<slug>.json，快闸门断言这两边相等。
+      - name: 上传报告与截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-shots
+          path: |
+            test/artifacts/
+            docs/screenshots/
+          if-no-files-found: error
+      # 只有截图闸门绿了才回写。红的时候提交上去，等于把黑图钉进仓库。
+      #
+      # 提交信息里的 [skip ci] 是承重的：这一步推回的是**同一条分支**，而这个
+      # workflow 就挂在这条分支的 push 上 —— 没有它就是一个无限循环。
+      # 快闸门有一条断言在守这个标记。
+      - name: 回写截图
+        if: steps.gate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/screenshots
+          if git diff --cached --quiet; then
+            echo '截图与仓库里的完全一致，没有需要提交的改动'
+            exit 0
+          fi
+          git commit -m 'chore(shots): 由 CI 重新生成截图 [skip ci]'
+          git push origin HEAD:${{ github.ref_name }}
+          git log -1 --stat
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  # 这个 job 是补上来的。截图流水线一开始没有回写，于是第一次失败时报告只存在
+  # 于 CI 日志里 —— 而那是 agent 读不到的地方。从外面看，「跑了但没产出截图」
+  # 和「压根没跑」长得一模一样。送不出结论的闸门等于没跑。
+  summary:
+    name: 回报截图结果
+    if: always()
+    needs: [shots]
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    with:
+      node-version: '20'
+      gates: '[{"name":"截图生成器","result":"${{ needs.shots.result }}"}]'
+      composer-files: scripts/compose-shots-report.mjs scripts/lib/compose.mjs scripts/lib/report.mjs
+      composer-entry: scripts/compose-shots-report.mjs
+      marker: '<!-- todox-shots -->'

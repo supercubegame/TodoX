@@ -10,7 +10,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
-import { Report, GATES, RELEASE_GATES } from './lib/report.mjs';
+import { Report, GATES, RELEASE_GATES, SHOTS_GATES } from './lib/report.mjs';
+import { SHOTS, SHOT_DIR, MIN_BYTES } from './lib/shots.mjs';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -63,6 +64,10 @@ function walk(dir, out = []) {
   }
   return out;
 }
+// 密钥扫描只看文本文件。截图进仓库之后，二进制里凑巧出现一段密钥形状的字节
+// 就会给出一条谁也看不懂的偶发红 —— 而它防的东西（把密钥藏进 PNG）不现实。
+const BINARY_EXT = ['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.zip', '.asar', '.icns'];
+function isTextFile(f) { return !BINARY_EXT.includes(path.extname(f).toLowerCase()); }
 
 // 字符级扫描器，不用正则。用正则剥注释会在字符串里出现 // 或 /* 的时候整段吃掉
 // 代码 —— 那不是「少抓几个」，是让整类输入凭空消失。
@@ -118,12 +123,17 @@ function sample() {
 }
 
 // ---------------------------------------------------------------- workflow 扫描器
-// 每个函数都吃 text 参数：两条流水线共用同一套扫描器。以前只扫 verify.yml，
+// 每个函数都吃 text 参数：三条流水线共用同一套扫描器。以前只扫 verify.yml，
 // 那样 release.yml 可以自由地长出一个没有 pipefail 的 tee 而没人看得见 ——
 // 模板级的修复不会自己跨文件传染。
+//
+// 这张表是手写的，那就是漏继承的下一个藏身处：再加一份 workflow 而忘了登记，
+// 它就完全在扫描范围之外，可以自由长出假绿。所以下面有一条断言让**目录本身
+// 成为期望**：实际存在的文件集合必须等于这张表。
 const WF = {
   verify: { path: '.github/workflows/verify.yml', text: null },
-  release: { path: '.github/workflows/release.yml', text: null }
+  release: { path: '.github/workflows/release.yml', text: null },
+  screenshots: { path: '.github/workflows/screenshots.yml', text: null }
 };
 function wf(key) {
   if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
@@ -508,6 +518,27 @@ const CHECKS = [
     return `win=${b.win.target.join('/')}｜mac=${b.mac.target.join('/')}｜linux=${b.linux.target.join('/')}`;
   }],
 
+  // 这条是一次真实失败换来的：author 写成裸字符串时，AppImage 照样打出 102MB，
+  // 只有 deb 挂在「Please specify author 'email'」上。那个失败要等三分钟构建
+  // 才看得到，而它其实是一条几毫秒的静态不变量。
+  ['打包：.deb 的 maintainer 存在且是邮箱形状', () => {
+    const pkg = JSON.parse(readIfExists('package.json'));
+    const linux = (pkg.build && pkg.build.linux) || {};
+    const targets = (linux.target || []).map(t => String(t).toLowerCase());
+    expectTrue(targets.includes('deb'), 'linux.target 里没有 deb', JSON.stringify(linux, null, 2));
+    const author = pkg.author;
+    const email = author && typeof author === 'object' ? author.email : null;
+    const maintainer = linux.maintainer || null;
+    expectTrue(
+      (typeof email === 'string' && email.includes('@')) || (typeof maintainer === 'string' && maintainer.includes('@')),
+      'deb 目标缺少 maintainer',
+      `author=${JSON.stringify(author)}\nlinux.maintainer=${JSON.stringify(maintainer)}\n` +
+      "electron-builder 会报 Please specify author 'email' in the application package.json，" +
+      '而 AppImage 那一半照样成功 —— 所以症状是「Linux 只出了 1 个产物」，不是「构建全挂」。'
+    );
+    return `deb 在 target 里，maintainer=${maintainer || email}`;
+  }],
+
   ['文档：AGENTS.md 存在且不超过 200 行', () => {
     const text = readIfExists('AGENTS.md');
     const n = text.split('\n').length;
@@ -520,6 +551,38 @@ const CHECKS = [
     const b = fs.readFileSync(path.join(ROOT, 'CLAUDE.md'));
     expectTrue(a.equals(b), '两份规矩文件已经分叉', `AGENTS.md ${a.length} 字节 / CLAUDE.md ${b.length} 字节`);
     return `同一份内容，${a.length} 字节`;
+  }],
+
+  // README 里的破图不会让任何东西变红，只会让人以为项目没做完。所以三方对齐：
+  // README 引用了什么、SHOTS 清单说该有什么、磁盘上实际有什么。
+  // 负向那侧也在：多出一张没人引用的图同样红。
+  ['文档：README 引用的截图、SHOTS 清单、磁盘文件三方相等', () => {
+    const readme = readIfExists('README.md');
+    const referenced = [...readme.matchAll(/docs\/screenshots\/([A-Za-z0-9._-]+\.png)/g)].map(m => m[1]);
+    expectTrue(referenced.length > 0, 'README 里一张截图都没引用 —— 是扫描器坏了，不是 README 对了', readme.slice(0, 300));
+    const want = SHOTS.map(s => `${s.slug}.png`).sort();
+    expectEq([...new Set(referenced)].sort(), want, 'README 引用的截图集合');
+    const dir = path.join(ROOT, SHOT_DIR);
+    const onDisk = fs.readdirSync(dir).filter(n => n.toLowerCase().endsWith('.png')).sort();
+    expectEq(onDisk, want, `${SHOT_DIR} 下实际存在的截图集合`);
+    const sizes = want.map(n => ({ n, bytes: fs.statSync(path.join(dir, n)).size }));
+    const empty = sizes.filter(s => s.bytes <= MIN_BYTES).map(s => `${s.n}: ${s.bytes} 字节`);
+    expectEq(empty, [], `小于 ${MIN_BYTES} 字节的截图（像是空图）`);
+    return `${want.length} 张图三方一致：${sizes.map(s => `${s.n} ${(s.bytes / 1024).toFixed(0)}KB`).join('，')}`;
+  }],
+
+  // 这条是漏继承的解药。以前登记表是手写的两项，于是**新加的 workflow 文件完全
+  // 在扫描范围之外**：它可以自由长出一个没有 pipefail 的 tee，而所有 run 依然
+  // 全绿。手写清单永远追不上目录，所以让目录本身成为期望。
+  ['CI：.github/workflows 下每一份 workflow 都被扫描器登记（目录即期望）', () => {
+    const dir = path.join(ROOT, '.github', 'workflows');
+    const actual = fs.readdirSync(dir).filter(n => /\.ya?ml$/.test(n)).sort();
+    expectTrue(actual.length > 0, '一份 workflow 文件都没扫到 —— 是扫描器坏了，不是配置对了', `目录: ${dir}`);
+    const registered = Object.values(WF).map(w => path.basename(w.path)).sort();
+    expectEq(actual, registered, '已登记的 workflow 集合');
+    // 登记了但文件是空的也要红，否则 wf() 会在别的断言里抛一个看不懂的错。
+    for (const key of Object.keys(WF)) expectTrue(wf(key).length > 0, `${WF[key].path} 是空文件`);
+    return `${actual.length} 份 workflow 全部在扫描范围内：${actual.join(', ')}`;
   }],
 
   ['CI：所有 workflow 里出现 tee 的脚本块都设置了 pipefail', () => {
@@ -544,12 +607,12 @@ const CHECKS = [
     for (const key of Object.keys(WF)) {
       const jobs = jobBlocks(wf(key));
       const j = jobs.get('summary');
-      expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job`, [...jobs.keys()].join(','));
+      expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job —— 送不出结论的闸门等于没跑`, [...jobs.keys()].join(','));
       if (!j.text.includes('uses: supercubegame/ci-workflows/.github/workflows/report.yml@main')) bad.push(`${WF[key].path} 没有引用共享回写 workflow`);
       if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
     }
     expectEq(bad, [], '回写 job 的问题');
-    return '两份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps';
+    return `${Object.keys(WF).length} 份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps`;
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
@@ -611,6 +674,39 @@ const CHECKS = [
     return "release 只认 release/**（不挂 main，不挂 **），verify 仍覆盖 ** —— 该跑不跑要红，不该跑却跑了也要红";
   }],
 
+  // 截图 job 把 PNG 推回**同一条分支**，而这个 workflow 就挂在这条分支的 push 上。
+  // 提交信息里的跳过标记是唯一的循环终止条件 —— 截图不可能字节级复现，所以
+  // 「没有改动就不提交」在这里不成立。
+  ['CI：screenshots 的触发范围与回写循环守卫', () => {
+    const text = wf('screenshots');
+    const on = onBlock(text);
+    expectTrue(on.length > 0, 'screenshots.yml 里解析不到 on: 块 —— 扫描器坏了', text.slice(0, 300));
+    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
+    expectEq(branches, ["branches: ['docs/**', 'shots/**']"], 'screenshots.yml 的分支过滤');
+    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'screenshots.yml 没有手动触发的口子', on.join('\n'));
+    const jobs = jobBlocks(text);
+    expectTrue(jobs.has('shots'), 'screenshots.yml 里没有 shots job', [...jobs.keys()].join(','));
+    const j = jobs.get('shots');
+    expectEq(j.lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim()), [], 'shots job 上的 job 级 if');
+    expectTrue(j.text.includes('contents: write'), 'shots job 没有 contents: write，回写会直接失败', j.text.slice(0, 400));
+    expectTrue(text.includes('[skip ci]'), '回写提交没有跳过 CI 的标记 —— 它推回同一条分支，会再次触发自己，无限循环', '截图不可能字节级复现，所以「没改动就不提交」拦不住这个循环');
+    expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 600));
+    return "只认 docs/** 与 shots/**，job 无条件执行，带 contents:write、[skip ci] 与「绿了才回写」三重守卫";
+  }],
+
+  // 另外两条流水线早就有「产物名与清单对齐」这条断言，截图这条没有 ——
+  // 那就是同一个漏继承又长了一遍。少了它，composer 会去找一个没人产出的 slug，
+  // 然后报告里只剩一句「没有产出报告」。
+  ['CI：screenshots 的产物名与 stdout 日志集合等于 SHOTS_GATES', () => {
+    const names = tokenSet(wf('screenshots'), RE_REPORT);
+    const wantNames = new Set(SHOTS_GATES.map(g => `report-${g.slug}`));
+    expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
+    const slugs = tokenSet(wf('screenshots'), RE_STDOUT);
+    const wantSlugs = new Set(SHOTS_GATES.map(g => g.slug));
+    expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
+    return `${names.size} 个产物 + ${slugs.size} 条日志，与 SHOTS_GATES 完全相等`;
+  }],
+
   ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
     const slugs = matrixSlugs(wf('release')).slice().sort();
     const want = RELEASE_GATES.map(g => g.slug).filter(s => s.startsWith('dist-')).sort();
@@ -649,14 +745,14 @@ const CHECKS = [
   }],
 
   ['密钥：哨兵在源码与报告里出现 0 次（负向）', () => {
-    const files = walk(ROOT);
+    const files = walk(ROOT).filter(isTextFile);
     const hits = files.filter(f => {
       try { return fs.readFileSync(f, 'utf8').includes(SENTINEL); } catch { return false; }
     }).map(f => path.relative(ROOT, f));
     expectEq(hits, [], '哨兵泄漏的文件');
     const inReport = JSON.stringify(report.toJSON()).includes(SENTINEL);
     expectTrue(!inReport, '哨兵密钥泄漏进了报告本体', '报告会被原样贴到 PR 评论里');
-    return `哨兵（每次运行随机生成）在 ${files.length} 个文件与报告 JSON 中出现 0 次`;
+    return `哨兵（每次运行随机生成）在 ${files.length} 个文本文件与报告 JSON 中出现 0 次`;
   }],
 
   ['密钥：仓库里没有密钥形状的字面量', () => {
@@ -668,13 +764,15 @@ const CHECKS = [
       ['Slack token', new RegExp(['xox', '[abpr]-[A-Za-z0-9-]{12,}'].join(''))]
     ];
     const hits = [];
-    for (const f of walk(ROOT)) {
+    let scanned = 0;
+    for (const f of walk(ROOT).filter(isTextFile)) {
       let text = '';
       try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+      scanned += 1;
       for (const [name, re] of patterns) if (re.test(text)) hits.push(`${path.relative(ROOT, f)}: ${name}`);
     }
     expectEq(hits, [], '密钥形状的字面量');
-    return '4 类密钥形状全部 0 命中（模式由拼接构造，扫描不会抓到自己）';
+    return `${scanned} 个文本文件、4 类密钥形状全部 0 命中（模式由拼接构造，扫描不会抓到自己）`;
   }],
 
   ['自检：标题唯一 + 实际检查数等于清单数', () => {
