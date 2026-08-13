@@ -8,8 +8,12 @@
 //   没变的话）、state 全是 uploaded。审计全绿，而这次一个字节都没送出去。
 //
 // 所以正向痕迹用 **sha256 摘要**：逐个比对私有仓与公开仓同名资产的 digest。
-// 名字只能证明「有个叫这个名的文件」，摘要能证明「就是刚打出来的那一份字节」。
+// 名字只能证明「有个叫这个名的文件」，摘要能证明「就是刚打出来的那份字节」。
 // 这是「验最终产物，不验接口被调用过」的同一条规矩。
+//
+// **审计时公开仓的 Release 必须还是草稿。** 顺序是：建草稿 -> 上传 -> 审计 ->
+// 通过了才转正。第一版写反了，结果那次失败留下一个「对外可见但 0 个资产」的
+// Release,那正是我在私有仓那条链路上防住、却在这条上重犯的错。
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -26,6 +30,12 @@ const TAG = process.env.TODOX_RELEASE_TAG || '';
 // 「发布前清点资产」是一组。改一个必须重算另外三个（见 AGENTS.md）。
 const EXPECT_TOTAL = 8;
 const MIN_BYTES = 30 * 1024 * 1024;
+
+// electron-builder 给 NSIS 安装包的文件名带空格。GitHub 上传时会把空格换成点，
+// 所以两边的**资产名**都是 TodoX.Setup.x.y.z.exe,但本地文件名是带空格的，
+// 而 `gh release upload $(find ...)` 不加引号就会把它词分割成三个参数。
+// 那次 upload 立刻失败，而症状是「公开仓一个资产都没有」。
+const SPACEY_ASSET = /^TodoX\.Setup\..*\.exe$/;
 
 if (TAG === '') {
   process.stderr.write('TODOX_RELEASE_TAG 是空的 —— 不知道该核对哪个 Release\n');
@@ -48,6 +58,24 @@ function expectTrue(cond, label, evidence) { if (!cond) fail(label, evidence); }
 function tailOf(s, n = 40) { return String(s || '').trimEnd().split('\n').slice(-n).join('\n'); }
 function mb(n) { return `${(n / 1024 / 1024).toFixed(1)} MB`; }
 
+// 级联守卫。前一条失败时，后面几条会拿 null 去取属性，报出一串
+// 「Cannot read properties of null」—— 那是噪音，不是根因，而报告的价值就在于
+// 「只看这条评论能不能定位根因」。依赖顺序上的失败要归因到最前面那个。
+function requireLoaded(which, value, firstCheck) {
+  expectTrue(value !== null, `${which}还没读到，这条无从谈起`,
+    `根因在前面那条「${firstCheck}」,先看它的证据，别在这里找。`);
+  return value;
+}
+
+// 空集合守卫。第一版没有它，资产为空时脚本崩在 sized[0].name，于是两条断言的
+// 说明变成「Cannot read properties of undefined」—— 同样不是能定位根因的证据。
+function requireAssets(which, list) {
+  expectTrue(list.length > 0, `${which}一个资产都没有,后面每条比对都无从谈起`,
+    `这通常是上传那步整体失败（比如带空格的文件名被词分割），不是「少了几个」。\n` +
+    `先看同步那一步的日志尾巴。`);
+  return list;
+}
+
 function gh(args, label) {
   const r = spawnSync('gh', args, { cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
   if (r.error) fail(`${label}：gh 起不来`, String(r.error.message));
@@ -55,46 +83,68 @@ function gh(args, label) {
   return r.stdout || '';
 }
 
-// 读服务端那份，不读本地。本地那些文件是我刚上传的东西，读它等于自己给自己打分。
-function readRelease(repo, label) {
-  const raw = gh(['api', `repos/${repo}/releases/tags/${TAG}`], label);
-  const rel = JSON.parse(raw);
-  expectTrue(Array.isArray(rel.assets), `${label}：assets 不是数组`, raw.slice(0, 400));
+function shape(rel) {
   return {
     tag: rel.tag_name,
     draft: rel.draft,
     prerelease: rel.prerelease,
     url: rel.html_url,
-    assets: rel.assets.map(a => ({
+    assets: (rel.assets || []).map(a => ({
       name: a.name,
       size: a.size,
       state: a.state,
-      // GitHub 现在会给出 "sha256:..." 形式的摘要。缺失时下面那条断言会红,
+      // GitHub 会给出 "sha256:..." 形式的摘要。缺失时下面那条断言会红,
       // 而不是静默降级成「只比名字」。
       digest: a.digest || null
     }))
   };
 }
 
+// **按 tag 直接取是不行的。** `GET /releases/tags/{tag}` 对草稿返回 404,
+// 草稿还没有 tag ref。而镜像那边是「先建草稿、审计通过才转正」，所以这里
+// 必须走列表按 tag_name 找。列表端点对有推送权限的令牌会返回草稿，
+// 而且带 digest 字段（`gh release view --json` 不带）。
+//
+// 这个坑的形状值得记：**审计的读取路径本身也有前提**，而那个前提被我上一轮
+// 改发布顺序时弄坏了。闸门红了先查夹具。
+function findRelease(repo, label) {
+  const raw = gh(['api', `repos/${repo}/releases?per_page=100`], label);
+  const list = JSON.parse(raw);
+  expectTrue(Array.isArray(list), `${label}：返回的不是数组`, raw.slice(0, 400));
+  expectTrue(list.length > 0, `${label}：${repo} 上一个 Release 都没有`, '同步那步大概整体没跑起来');
+  const hit = list.find(r => r.tag_name === TAG);
+  expectTrue(Boolean(hit), `${label}：${repo} 上找不到 ${TAG}`,
+    `现有 tag：${list.map(r => `${r.tag_name}${r.draft ? '(草稿)' : ''}`).join(', ')}`);
+  return shape(hit);
+}
+
+// 私有仓那边是已经转正的正式发布，按 tag 取没问题；但用同一条路径读两边
+// 更少一个分歧点。
 const CHECKS = [
   ['读到私有仓这个 tag 的真实资产（先证明解析成功）', () => {
-    state.src = readRelease(SRC_REPO, '读取源 Release');
+    state.src = findRelease(SRC_REPO, '读取源 Release');
     expectEq(state.src.tag, TAG, '源 Release 的 tag');
+    requireAssets('私有仓 Release 上', state.src.assets);
     expectEq(state.src.assets.length, EXPECT_TOTAL, '源 Release 的资产数');
     const bad = state.src.assets.filter(a => a.state !== 'uploaded').map(a => `${a.name}: ${a.state}`);
     expectEq(bad, [], '源 Release 里未完成上传的资产');
     return `${SRC_REPO} ${TAG}：${EXPECT_TOTAL} 个资产，合计 ${mb(state.src.assets.reduce((n, a) => n + a.size, 0))}`;
   }],
 
-  ['读到公开仓同 tag 的真实资产', () => {
-    state.mirror = readRelease(MIRROR_REPO, '读取镜像 Release');
+  ['读到公开仓同 tag 的资产，且它还是草稿（转正在审计之后）', () => {
+    state.mirror = findRelease(MIRROR_REPO, '读取镜像 Release');
     expectEq(state.mirror.tag, TAG, '镜像 Release 的 tag');
-    expectTrue(state.mirror.draft === false, '镜像 Release 还是草稿 —— 别人下载不到', JSON.stringify(state.mirror, null, 2));
-    expectTrue(state.mirror.prerelease === false, '镜像 Release 被标成了预发布', JSON.stringify({ prerelease: state.mirror.prerelease }));
-    return `${MIRROR_REPO} ${TAG}：${state.mirror.assets.length} 个资产，已正式发布`;
+    requireAssets('公开仓 Release 上', state.mirror.assets);
+    // 顺序断言：审计跑的时候它必须还没对外可见。写反了就会留下一个
+    // 「对外可见但资产不全」的 Release —— 从外面看和正常的一模一样。
+    expectTrue(state.mirror.draft === true, '镜像 Release 在审计之前就已经转正了,顺序错了',
+      `期望 draft=true，实际 draft=${state.mirror.draft}\n` +
+      '正确顺序：建草稿 -> 上传 -> 审计通过 -> 才 --draft=false。');
+    return `${MIRROR_REPO} ${TAG}：${state.mirror.assets.length} 个资产，仍是草稿（等审计放行）`;
   }],
 
   ['两边的资产名集合完全相等（等号 + 负向孪生）', () => {
+    requireLoaded('公开仓 Release', state.mirror, '读到公开仓同 tag 的资产');
     const src = state.src.assets.map(a => a.name).sort();
     const dst = state.mirror.assets.map(a => a.name).sort();
     const missing = src.filter(n => !dst.includes(n));
@@ -106,7 +156,22 @@ const CHECKS = [
     return `${EXPECT_TOTAL} 个资产名逐一对上，两侧都没有多余`;
   }],
 
+  // 这条守一次真实失败：本地文件名 `TodoX Setup 1.0.2.exe` 带空格，
+  // `gh release upload $(find ...)` 不加引号会把它词分割成三个参数，
+  // upload 整体失败 —— 症状是「公开仓一个资产都没有」，看不出是空格的事。
+  ['带空格的安装包也上传成功了（曾被词分割整体吃掉）', () => {
+    requireLoaded('公开仓 Release', state.mirror, '读到公开仓同 tag 的资产');
+    const hit = state.mirror.assets.filter(a => SPACEY_ASSET.test(a.name));
+    expectTrue(hit.length === 1, '公开仓上找不到 NSIS 安装包（本地文件名带空格的那个）',
+      `实际资产名：${state.mirror.assets.map(a => a.name).join(', ')}\n` +
+      '本地文件名是 `TodoX Setup <版本>.exe`，GitHub 上传时把空格换成点。\n' +
+      '它整个消失通常意味着上传命令没给文件名加引号。');
+    expectTrue(hit[0].size > MIN_BYTES, `${hit[0].name} 只有 ${mb(hit[0].size)}`, JSON.stringify(hit[0]));
+    return `${hit[0].name}，${mb(hit[0].size)}`;
+  }],
+
   ['每个资产的 state 是 uploaded，体积都超过 30MB', () => {
+    requireLoaded('公开仓 Release', state.mirror, '读到公开仓同 tag 的资产');
     const bad = state.mirror.assets.filter(a => a.state !== 'uploaded').map(a => `${a.name}: ${a.state}`);
     expectEq(bad, [], '未完成上传的资产');
     const sized = state.mirror.assets.slice().sort((x, y) => x.size - y.size);
@@ -117,6 +182,7 @@ const CHECKS = [
 
   // 这条是这整个 job 的意义所在。没有它，「同步坏了但公开仓留着上一版」会全绿。
   ['每个资产的 sha256 与私有仓逐一相同（正向痕迹）', () => {
+    requireLoaded('公开仓 Release', state.mirror, '读到公开仓同 tag 的资产');
     const srcMap = new Map(state.src.assets.map(a => [a.name, a.digest]));
     const noDigest = state.mirror.assets.filter(a => !a.digest).map(a => a.name);
     // 摘要缺失不许静默降级成「只比名字」—— 那样这条断言就变成空的了。

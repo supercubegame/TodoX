@@ -167,6 +167,10 @@ jobs:
   # 私有仓转 private 之后，公开下载得走 todox-desktop 的 Release，所以八个
   # 安装包要同步过去。
   #
+  # 顺序是承重的：**建草稿 -> 上传 -> 审计 -> 通过了才转正。** 第一版直接建成
+  # 非草稿，那次上传失败后在公开仓留下一个「对外可见但 0 个资产」的 Release，
+  # 从外面看和正常的一模一样。草稿是个看得见的失败态。
+  #
   # 这个 job **没有 job 级 if**：条件写歪会让它静默永不执行，而 run 依然全绿。
   # publish 挂了它会因依赖失败被跳过，那时 composer 报「没有产出报告」——
   # 响亮，而且原因就在同一条评论里（publish 的 result 也在 gates 数组里）。
@@ -202,7 +206,10 @@ jobs:
           pattern: installers-*
           merge-multiple: true
 
-      - name: 同步到公开仓 Release
+      # 文件名一定要用 -print0 | xargs -0 传。`$(find ...)` 不加引号会把
+      # `TodoX Setup 1.0.2.exe` 词分割成三个参数，upload 整体失败,而症状是
+      # 「公开仓一个资产都没有」，完全看不出是空格的事。审计里有一条专门守它。
+      - name: 同步到公开仓 Release（先建草稿）
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
@@ -214,17 +221,18 @@ jobs:
           n=$(find installers -type f | wc -l | tr -d ' ')
           echo "准备同步 $n 个文件到 $MIRROR $TAG"
           test "$n" -eq 8
+          find installers -type f -printf '  %f  %s 字节\n'
           notes=$(printf 'TodoX %s — 跨平台桌面待办事项应用。\n\n| 平台 | 下载 |\n| --- | --- |\n| Windows | `TodoX Setup *.exe`（安装版）或 `*-win.zip`（免安装） |\n| macOS | `*-arm64.dmg`（Apple 芯片）或 `*-x64.dmg`（Intel） |\n| Linux | `*.AppImage`（`chmod +x` 后直接跑）或 `*.deb` |\n\n**安装包没有签名。** macOS 会提示无法验证开发者，到「系统设置 → 隐私与安全性」点「仍要打开」；Windows SmartScreen 会拦一次，点「更多信息」→「仍要运行」。\n' "$TAG")
           if gh release view "$TAG" --repo "$MIRROR" >/dev/null 2>&1; then
-            echo "$TAG 已存在，清空旧资产后重传"
+            echo "$TAG 已存在，退回草稿并清空旧资产后重传"
+            gh release edit "$TAG" --repo "$MIRROR" --draft=true --prerelease=false --notes "$notes"
             for name in $(gh release view "$TAG" --repo "$MIRROR" --json assets -q '.assets[].name'); do
               gh release delete-asset "$TAG" "$name" --repo "$MIRROR" --yes
             done
-            gh release edit "$TAG" --repo "$MIRROR" --notes "$notes" --draft=false --prerelease=false
           else
-            gh release create "$TAG" --repo "$MIRROR" --title "TodoX $TAG" --notes "$notes"
+            gh release create "$TAG" --repo "$MIRROR" --draft --title "TodoX $TAG" --notes "$notes"
           fi
-          gh release upload "$TAG" $(find installers -type f) --repo "$MIRROR" --clobber
+          find installers -type f -print0 | xargs -0 gh release upload "$TAG" --repo "$MIRROR" --clobber
           gh release view "$TAG" --repo "$MIRROR" --json tagName,isDraft,assets
 
       # 上传接口收下了不等于公开仓那边挂上去了，更不等于挂的是**这次**打的包。
@@ -241,6 +249,21 @@ jobs:
           set -o pipefail
           mkdir -p test/artifacts
           node scripts/verify-release-mirror.mjs 2>&1 | tee test/artifacts/stdout-release-mirror.log
+
+      # 审计通过了才对外可见。审计红的时候公开仓上留下的是一个草稿,
+      # 别人下载不到半成品，而我看得见它红在哪。
+      - name: 审计通过才转正
+        if: steps.gate.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          TAG: ${{ needs.publish.outputs.tag }}
+          MIRROR: supercubegame/todox-desktop
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$MIRROR" --draft=false --latest
+          gh release view "$TAG" --repo "$MIRROR" --json tagName,isDraft,isLatest,url
+
       - name: 上传报告
         if: always()
         uses: actions/upload-artifact@v4
