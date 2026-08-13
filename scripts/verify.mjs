@@ -64,6 +64,42 @@ function walk(dir, out = []) {
   return out;
 }
 
+// 字符级扫描器，不用正则。用正则剥注释会在字符串里出现 // 或 /* 的时候整段吃掉
+// 代码 —— 那不是「少抓几个」，是让整类输入凭空消失。
+function stripComments(src) {
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    const d = i + 1 < n ? src[i + 1] : '';
+    if (c === '/' && d === '/') {
+      while (i < n && src[i] !== '\n') i += 1;
+      continue;
+    }
+    if (c === '/' && d === '*') {
+      i += 2;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      out += c;
+      i += 1;
+      while (i < n) {
+        if (src[i] === '\\') { out += src[i] + (src[i + 1] || ''); i += 2; continue; }
+        out += src[i];
+        if (src[i] === c) { i += 1; break; }
+        i += 1;
+      }
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- 核心与夹具
 let core = null;
 function getCore() {
@@ -82,7 +118,6 @@ function sample() {
 }
 
 // ---------------------------------------------------------------- workflow 扫描器
-// 用扫描器，不用大正则：带 ${{ }} 的 token 会让回溯型正则整类输入凭空消失。
 const WF_PATH = '.github/workflows/verify.yml';
 let wfText = null;
 function wf() { if (wfText == null) wfText = readIfExists(WF_PATH); return wfText; }
@@ -391,12 +426,21 @@ const CHECKS = [
     expectTrue(files.length > 0, 'src/core 下一个文件都没有', `目录: ${dir}`);
     const banned = ['Date.now', 'new Date', 'Math.random', "require('fs')", 'require("fs")', 'process.', 'window.', 'document.', 'localStorage', 'fetch('];
     const hits = [];
+    let scanned = 0;
     for (const f of files) {
-      const text = fs.readFileSync(f, 'utf8');
-      for (const b of banned) if (text.includes(b)) hits.push(`${path.relative(ROOT, f)} 含 ${b}`);
+      const rel = path.relative(ROOT, f);
+      const raw = fs.readFileSync(f, 'utf8');
+      // 只扫会执行的代码。注释里写「别往里塞 Date.now()」是文档，不是违规 ——
+      // 上一版没剥注释，第一次跑就被自己的说明文字抓了，根因在夹具不在产品。
+      const code = stripComments(raw);
+      // 解析式的断言要先证明解析成功：剥成空字符串的话下面每一条都会免费通过。
+      expectTrue(code.includes('module.exports'), `剥注释后 ${rel} 里连 module.exports 都没了`, `原文 ${raw.length} 字节 -> 剥后 ${code.length} 字节，扫描器坏了`);
+      expectTrue(code.length > raw.length * 0.4, `剥注释把 ${rel} 剥掉了太多`, `${raw.length} -> ${code.length} 字节`);
+      scanned += code.length;
+      for (const b of banned) if (code.includes(b)) hits.push(`${rel} 含 ${b}`);
     }
     expectEq(hits, [], '核心里的不纯用法');
-    return `${files.length} 个核心文件，10 类不纯用法全部 0 命中`;
+    return `${files.length} 个核心文件、${scanned} 字节可执行代码，10 类不纯用法全部 0 命中`;
   }],
 
   ['纯度：同样输入连续两次调用结果深度相等', () => {
@@ -413,7 +457,7 @@ const CHECKS = [
   ['主进程：窗口可调整大小且用 clampBounds 恢复', () => {
     const text = readIfExists('src/main/main.js');
     for (const need of ['minWidth', 'minHeight', 'clampBounds', 'setBounds']) {
-      expectTrue(text.includes(need), `main.js 里找不到 ${need}`, `这条静态断言的行为孪生在端到端闸门里（isResizable / getMinimumSize / 真的 resize）`);
+      expectTrue(text.includes(need), `main.js 里找不到 ${need}`, '这条静态断言的行为孪生在端到端闸门里（isResizable / getMinimumSize / 真的 resize）');
     }
     expectTrue(!text.includes('resizable: false'), 'main.js 把窗口设成了不可调整大小', '需求要求窗口大小可以随意调节');
     return 'minWidth/minHeight/clampBounds/setBounds 齐全，没有 resizable:false';
@@ -421,7 +465,6 @@ const CHECKS = [
 
   ['主进程：contextIsolation / nodeIntegration / preload 安全不变量', () => {
     const text = readIfExists('src/main/main.js');
-    readIfExists('src/preload/preload.js');
     expectTrue(text.includes('contextIsolation: true'), '缺少 contextIsolation: true');
     expectTrue(text.includes('nodeIntegration: false'), '缺少 nodeIntegration: false');
     expectTrue(text.includes('preload:'), '没有挂 preload');
