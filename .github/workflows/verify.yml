@@ -86,6 +86,37 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: exit 1
 
+  # 性能闸门压的是纯核心，所以既不用 npm install 也不用显示器 —— 它是四条
+  # 闸门里最便宜的一条。--expose-gc 是给「撤销栈的堆增长」那条断言用的：
+  # 没有确定的 GC 时机，堆测量就是掷骰子。脚本自己也会带上这个参数重启一遍，
+  # 这里显式写出来是为了省一次进程启动，并且让意图留在 workflow 里。
+  perf:
+    name: 性能压测闸门
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 跑性能压测闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node --expose-gc scripts/verify-perf.mjs 2>&1 | tee test/artifacts/stdout-perf.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-perf
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
   pack:
     name: 打包闸门
     runs-on: ${{ matrix.os }}
@@ -142,14 +173,14 @@ jobs:
   summary:
     name: 回报结果
     if: always()
-    needs: [fast, e2e, pack]
+    needs: [fast, e2e, perf, pack]
     permissions:
       contents: write
       pull-requests: write
     uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
     with:
       node-version: '20'
-      gates: '[{"name":"快闸门","result":"${{ needs.fast.result }}"},{"name":"Electron 端到端闸门","result":"${{ needs.e2e.result }}"},{"name":"三平台打包闸门","result":"${{ needs.pack.result }}"}]'
+      gates: '[{"name":"快闸门","result":"${{ needs.fast.result }}"},{"name":"Electron 端到端闸门","result":"${{ needs.e2e.result }}"},{"name":"性能压测闸门","result":"${{ needs.perf.result }}"},{"name":"三平台打包闸门","result":"${{ needs.pack.result }}"}]'
       composer-files: scripts/compose-report.mjs scripts/lib/report.mjs scripts/lib/compose.mjs
       composer-entry: scripts/compose-report.mjs
       marker: '<!-- todox-verify -->'

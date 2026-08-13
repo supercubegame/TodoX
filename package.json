@@ -13,6 +13,7 @@
     "start": "electron .",
     "verify": "node scripts/verify.mjs",
     "verify:e2e": "node scripts/verify-e2e.mjs",
+    "verify:perf": "node --expose-gc scripts/verify-perf.mjs",
     "verify:pack": "node scripts/verify-pack.mjs",
     "verify:dist": "node scripts/verify-dist.mjs",
     "verify:release": "node scripts/verify-release.mjs",

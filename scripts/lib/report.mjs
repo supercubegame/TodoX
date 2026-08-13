@@ -13,6 +13,7 @@ import path from 'node:path';
 export const GATES = [
   { slug: 'fast', label: '快闸门（纯核心 + 静态断言）' },
   { slug: 'e2e', label: 'Electron 端到端闸门' },
+  { slug: 'perf', label: '性能压测闸门（纯核心）' },
   { slug: 'pack-linux', label: '打包闸门 · Linux' },
   { slug: 'pack-mac', label: '打包闸门 · macOS' },
   { slug: 'pack-win', label: '打包闸门 · Windows' }
