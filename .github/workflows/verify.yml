@@ -3,6 +3,9 @@ name: verify
 # 只挂 push。挂 pull_request 会让每次推送跑两遍，而回写那个 job 本来就会
 # 从 commit 反查 PR。这里**没有任何 job 级 if**：条件写歪会让 job 静默永不
 # 执行，而所有 run 依然全绿。快闸门有一条断言在守这件事。
+#
+# branches 是 ['**']，包括 release/** —— 发布分支上也要先过一遍全套闸门。
+# 快闸门有一条断言在守这个范围，别改窄。
 on:
   push:
     branches: ['**']
@@ -127,7 +130,7 @@ jobs:
 
   # ==========================================================================
   # 回写不在这里。它是 supercubegame/ci-workflows 里的一份文件，image-grabber
-  # 和 jumpwow 用的是同一份。
+  # 和 jumpwow 用的是同一份，release.yml 也用同一份。
   #
   # 那个 job 里每一条不寻常的设计（不 checkout、兜底评论前置、取脚本和回写都
   # 带重试、降级报告自己说明自己是降级的）都写在那份文件的头部注释里。
@@ -147,6 +150,6 @@ jobs:
     with:
       node-version: '20'
       gates: '[{"name":"快闸门","result":"${{ needs.fast.result }}"},{"name":"Electron 端到端闸门","result":"${{ needs.e2e.result }}"},{"name":"三平台打包闸门","result":"${{ needs.pack.result }}"}]'
-      composer-files: scripts/compose-report.mjs scripts/lib/report.mjs
+      composer-files: scripts/compose-report.mjs scripts/lib/report.mjs scripts/lib/compose.mjs
       composer-entry: scripts/compose-report.mjs
       marker: '<!-- todox-verify -->'
