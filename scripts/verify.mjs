@@ -4,6 +4,9 @@
 //
 // 每一条断言都问过同一个问题：如果这个功能完全没实现，这条会不会失败？
 // 不会失败的就是空断言，不许留在这里。
+//
+// 第二个自问同样重要：**我在乎的属性里，有哪一个完全没有断言在看？**
+// 覆盖缺口和空断言在报告上长得一模一样 —— 都是全绿。
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -110,6 +113,11 @@ let core = null;
 function getCore() {
   if (!core) core = require(path.join(ROOT, 'src', 'core', 'store.js'));
   return core;
+}
+let hist = null;
+function getHist() {
+  if (!hist) hist = require(path.join(ROOT, 'src', 'core', 'history.js'));
+  return hist;
 }
 let seedCounter = 0;
 function ctx(now) { seedCounter += 1; return { id: `fix-${seedCounter}`, now: now == null ? 1000 + seedCounter : now }; }
@@ -460,6 +468,114 @@ const CHECKS = [
     return `丢弃 4 条 + 主题回默认，共记录 ${r.issues.length} 条 issue`;
   }],
 
+  // ------------------------------------------------------------ 撤销 / 重做
+  // 纯核心让这个功能几乎白送：状态本来就不可变，撤销不需要「反向操作」，
+  // 只要一个状态栈。下面六条每条都配了负向那侧。
+  ['历史：初始为空，记录一次后深度 1（摘要正确）', () => {
+    const h = getHist();
+    const empty = h.createHistory();
+    expectEq(h.summary(empty), { canUndo: false, canRedo: false, undoDepth: 0, redoDepth: 0, limit: h.HISTORY_LIMIT }, '空历史的摘要');
+    const after = h.record(empty, sample());
+    expectEq(h.summary(after), { canUndo: true, canRedo: false, undoDepth: 1, redoDepth: 0, limit: h.HISTORY_LIMIT }, '记录一次后的摘要');
+    // 负向：记录不该凭空造出可重做的东西。
+    expectEq(after.future, [], '记录之后的 future');
+    return `上限 ${h.HISTORY_LIMIT}；空历史 canUndo=false，记录一次后 canUndo=true 且 canRedo 仍为 false`;
+  }],
+
+  ['历史：撤销回到上一状态，重做再回来，且不改动入参', () => {
+    const c = getCore();
+    const h = getHist();
+    const s0 = sample();
+    const s1 = c.removeTodo(s0, 'b');
+    const h1 = deepFreeze(h.record(h.createHistory(), s0));
+    const frozenBefore = JSON.stringify(h1);
+
+    const back = h.undo(h1, s1);
+    expectEq(back.state, s0, '撤销后的状态');
+    expectEq(back.history.past, [], '撤销后的 past');
+    expectEq(back.history.future.length, 1, '撤销后的 future 深度');
+
+    const fwd = h.redo(back.history, back.state);
+    expectEq(fwd.state, s1, '重做后的状态');
+    expectEq(fwd.history.future, [], '重做后的 future');
+    expectEq(fwd.history.past.length, 1, '重做后的 past 深度');
+
+    // 入参被 deepFreeze 过：没抛 TypeError 说明没有就地写入。
+    expectEq(JSON.stringify(h1), frozenBefore, '原历史');
+    return '3 条 -> 删 1 条 -> 撤销回 3 条 -> 重做回 2 条，原历史逐字节未变';
+  }],
+
+  ['历史：空历史撤销与无重做项时重做各自抛错（负向）', () => {
+    const h = getHist();
+    const s = sample();
+    expectThrows(() => h.undo(h.createHistory(), s), 'NOTHING_TO_UNDO', '空历史撤销');
+    expectThrows(() => h.redo(h.createHistory(), s), 'NOTHING_TO_REDO', '空历史重做');
+    // 只记录过、没撤销过的时候，也不该能重做。
+    const recorded = h.record(h.createHistory(), s);
+    expectThrows(() => h.redo(recorded, s), 'NOTHING_TO_REDO', '只记录过就重做');
+    return '三种走不通的路径都抛对应错误码，而不是静默返回原状态';
+  }],
+
+  ['历史：新改动清空重做链（负向孪生）', () => {
+    const c = getCore();
+    const h = getHist();
+    const s0 = sample();
+    const s1 = c.removeTodo(s0, 'b');
+    const back = h.undo(h.record(h.createHistory(), s0), s1);
+    expectEq(h.summary(back.history).canRedo, true, '撤销之后应该可以重做');
+    // 撤销之后产生了新分支：原来那条重做链已经不可达，留着它会让用户
+    // 重做出一个跟当前状态无关的东西。
+    const s2 = c.removeTodo(back.state, 'c');
+    const branched = h.record(back.history, back.state);
+    expectEq(h.summary(branched).canRedo, false, '新改动之后还能重做');
+    expectThrows(() => h.redo(branched, s2), 'NOTHING_TO_REDO', '新分支之后重做');
+    return '撤销后 canRedo=true；再改一次之后 canRedo=false 且重做抛错';
+  }],
+
+  ['历史：上限真的可达，最老那份被丢掉（不是装饰）', () => {
+    const c = getCore();
+    const h = getHist();
+    const limit = h.HISTORY_LIMIT;
+    let s = c.createState();
+    let history = h.createHistory();
+    const first = s;
+    // 推 limit + 1 次，让上限真的被撞一次。一个默认参数下永远碰不到的边界，
+    // 和空断言是同一个洞。
+    for (let i = 0; i < limit + 1; i += 1) {
+      history = h.record(history, s);
+      s = c.addTodo(s, { title: `第 ${i} 条` }, { id: `h${i}`, now: i });
+    }
+    expectEq(history.past.length, limit, `推 ${limit + 1} 次之后的 past 深度`);
+    // 最老那份（空列表）应该已经被挤掉了：现在栈底是「已经有 1 条」的状态。
+    expectEq(history.past[0].todos.length, 1, '栈底状态的待办数');
+    expectEq(history.past.filter(x => x === first).length, 0, '最初那份状态在栈里的出现次数');
+    return `上限 ${limit}：推 ${limit + 1} 次后深度恰好 ${limit}，最初那份已被挤出（栈底变成有 1 条的状态）`;
+  }],
+
+  ['历史：不进存档，且主进程与界面都真的接上了', () => {
+    const c = getCore();
+    const h = getHist();
+    // 存档里不许出现历史：撤销跨重启没有意义，而且历史里每一项都是一份完整
+    // 状态，写进磁盘会让存档膨胀几十倍。
+    const s = sample();
+    const raw = c.serialize(s);
+    expectEq(JSON.parse(raw).history, undefined, '存档里的 history 字段');
+    expectEq(Object.keys(JSON.parse(raw)).sort(), ['bounds', 'settings', 'todos', 'version'], '存档的顶层字段');
+    expectEq(c.deserialize(raw).state.history, undefined, '读回来的 state 里的 history 字段');
+    // 光有核心不够：主进程、preload、界面三处都要真的接上，否则功能对用户
+    // 不存在，而上面五条照样全绿 —— 那是覆盖缺口。
+    const main = readIfExists('src/main/main.js');
+    for (const need of ["ipcMain.handle('history:undo'", "ipcMain.handle('history:redo'", 'hist.record']) {
+      expectTrue(main.includes(need), `main.js 里找不到 ${need}`, '核心实现了但没接上，等于对用户不存在');
+    }
+    const pre = readIfExists('src/preload/preload.js');
+    expectTrue(pre.includes('history:undo') && pre.includes('history:redo'), 'preload 没暴露 undo/redo');
+    const html = readIfExists('src/renderer/index.html');
+    expectTrue(html.includes('data-testid="undo"') && html.includes('data-testid="redo"'), '界面上没有撤销/重做按钮');
+    expectEq(h.summary(h.createHistory()).undoDepth, 0, '摘要的初始深度');
+    return '存档顶层只有 4 个字段（无 history）；主进程 IPC、preload、界面按钮三处都在';
+  }],
+
   ['纯度：src/core 不出现 Date.now / Math.random / fs / process / DOM', () => {
     const dir = path.join(ROOT, 'src', 'core');
     const files = walk(dir);
@@ -485,13 +601,16 @@ const CHECKS = [
 
   ['纯度：同样输入连续两次调用结果深度相等', () => {
     const c = getCore();
+    const h = getHist();
     const s = deepFreeze(sample());
     const a = c.selectTodos(s, { filter: 'all', sort: 'title', query: '' });
     const b = c.selectTodos(s, { filter: 'all', sort: 'title', query: '' });
     expectEq(a, b, '两次查询');
     expectEq(c.serialize(s), c.serialize(s), '两次序列化');
     expectEq(c.counts(s), { total: 3, active: 3, completed: 0 }, '计数');
-    return '查询与序列化各跑两次，结果逐字节一致';
+    // 历史那三个函数同样纯：同样输入必然同样输出。
+    expectEq(h.record(h.createHistory(), s), h.record(h.createHistory(), s), '两次记录');
+    return '查询、序列化、记录历史各跑两次，结果逐字节一致';
   }],
 
   ['主进程：窗口可调整大小且用 clampBounds 恢复', () => {
