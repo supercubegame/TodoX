@@ -73,6 +73,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -101,6 +103,9 @@ jobs:
           n=$(find installers -type f | wc -l | tr -d ' ')
           echo "将要发布 $n 个文件"
           test "$n" -eq 8
+      # 发布说明里**不写闸门条数**。那是硬编码散文，注定漂 —— v1.0.1 的说明里
+      # 写着 45 条而实际 51 条，而且漂了不会有任何动静。指向那次提交的报告评论，
+      # 它是自动生成的，永远和实际一致。
       - name: 建 Release 并上传资产
         uses: softprops/action-gh-release@v2
         with:
@@ -122,8 +127,8 @@ jobs:
             **安装包没有签名。** macOS 会拦，右键「打开」再确认一次；
             Windows SmartScreen 会拦，点「更多信息」→「仍要运行」。
 
-            这一版由 CI 验证：快闸门 45 项、Electron 端到端 18 项、
-            三平台打包各 4 项、安装包闸门各 6 项、发布资产校验 6 项。
+            这一版的逐项验证结果（快闸门 / 端到端 / 三平台安装包 / 发布资产校验）
+            回写在[构建那次提交的评论](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})里。
 
   # 发布那步退出码为 0 证明不了用户下载得到东西。这个 job 把 Release 从 API
   # 读回来数资产 —— 正向痕迹。它挂 if: always()，所以上游炸了它也会跑，
@@ -159,18 +164,106 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: exit 1
 
+  # 私有仓转 private 之后，公开下载得走 todox-desktop 的 Release，所以八个
+  # 安装包要同步过去。
+  #
+  # 这个 job **没有 job 级 if**：条件写歪会让它静默永不执行，而 run 依然全绿。
+  # publish 挂了它会因依赖失败被跳过，那时 composer 报「没有产出报告」——
+  # 响亮，而且原因就在同一条评论里（publish 的 result 也在 gates 数组里）。
+  mirror:
+    name: 同步 Release 到公开仓
+    needs: [dist, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 令牌缺失不许静默跳过。静默跳过和「同步成功」在面板上长得一模一样，
+      # 而这条链路的意义就是「公开的那份下载得到东西」。
+      - name: 确认镜像令牌存在
+        shell: bash
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MIRROR_TOKEN:-}" ]; then
+            echo '未配置 MIRROR_TOKEN，本次没有同步任何安装包（不是「同步成功」）。'
+            echo '需要一个对 supercubegame/todox-desktop 有 contents:write 权限的 PAT。'
+            exit 1
+          fi
+          echo '令牌就位'
+
+      - name: 下载三平台安装包
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
+          pattern: installers-*
+          merge-multiple: true
+
+      - name: 同步到公开仓 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          TAG: ${{ needs.publish.outputs.tag }}
+          MIRROR: supercubegame/todox-desktop
+        run: |
+          set -euo pipefail
+          test -n "$TAG"
+          n=$(find installers -type f | wc -l | tr -d ' ')
+          echo "准备同步 $n 个文件到 $MIRROR $TAG"
+          test "$n" -eq 8
+          notes=$(printf 'TodoX %s — 跨平台桌面待办事项应用。\n\n| 平台 | 下载 |\n| --- | --- |\n| Windows | `TodoX Setup *.exe`（安装版）或 `*-win.zip`（免安装） |\n| macOS | `*-arm64.dmg`（Apple 芯片）或 `*-x64.dmg`（Intel） |\n| Linux | `*.AppImage`（`chmod +x` 后直接跑）或 `*.deb` |\n\n**安装包没有签名。** macOS 会提示无法验证开发者，到「系统设置 → 隐私与安全性」点「仍要打开」；Windows SmartScreen 会拦一次，点「更多信息」→「仍要运行」。\n' "$TAG")
+          if gh release view "$TAG" --repo "$MIRROR" >/dev/null 2>&1; then
+            echo "$TAG 已存在，清空旧资产后重传"
+            for name in $(gh release view "$TAG" --repo "$MIRROR" --json assets -q '.assets[].name'); do
+              gh release delete-asset "$TAG" "$name" --repo "$MIRROR" --yes
+            done
+            gh release edit "$TAG" --repo "$MIRROR" --notes "$notes" --draft=false --prerelease=false
+          else
+            gh release create "$TAG" --repo "$MIRROR" --title "TodoX $TAG" --notes "$notes"
+          fi
+          gh release upload "$TAG" $(find installers -type f) --repo "$MIRROR" --clobber
+          gh release view "$TAG" --repo "$MIRROR" --json tagName,isDraft,assets
+
+      # 上传接口收下了不等于公开仓那边挂上去了，更不等于挂的是**这次**打的包。
+      # 这个闸门逐个比对 sha256 —— 详见 verify-release-mirror.mjs 头部。
+      - name: 跑公开仓 Release 校验闸门
+        id: gate
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          TODOX_RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify-release-mirror.mjs 2>&1 | tee test/artifacts/stdout-release-mirror.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-release-mirror
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
   # 回写走的是和 verify.yml 同一份共享 workflow，只是换了 composer 入口和 marker。
   summary:
     name: 回报结果
     if: always()
-    needs: [dist, publish, verify]
+    needs: [dist, publish, verify, mirror]
     permissions:
       contents: write
       pull-requests: write
     uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
     with:
       node-version: '20'
-      gates: '[{"name":"安装包闸门","result":"${{ needs.dist.result }}"},{"name":"发布 Release","result":"${{ needs.publish.result }}"},{"name":"发布资产校验闸门","result":"${{ needs.verify.result }}"}]'
+      gates: '[{"name":"安装包闸门","result":"${{ needs.dist.result }}"},{"name":"发布 Release","result":"${{ needs.publish.result }}"},{"name":"发布资产校验闸门","result":"${{ needs.verify.result }}"},{"name":"公开仓 Release 同步","result":"${{ needs.mirror.result }}"}]'
       composer-files: scripts/compose-release-report.mjs scripts/lib/report.mjs scripts/lib/compose.mjs
       composer-entry: scripts/compose-release-report.mjs
       marker: '<!-- todox-release -->'
