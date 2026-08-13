@@ -508,6 +508,27 @@ const CHECKS = [
     return `win=${b.win.target.join('/')}｜mac=${b.mac.target.join('/')}｜linux=${b.linux.target.join('/')}`;
   }],
 
+  // 这条是一次真实失败换来的：author 写成裸字符串时，AppImage 照样打出 102MB，
+  // 只有 deb 挂在「Please specify author 'email'」上。那个失败要等三分钟构建
+  // 才看得到，而它其实是一条几毫秒的静态不变量。
+  ['打包：.deb 的 maintainer 存在且是邮箱形状', () => {
+    const pkg = JSON.parse(readIfExists('package.json'));
+    const linux = (pkg.build && pkg.build.linux) || {};
+    const targets = (linux.target || []).map(t => String(t).toLowerCase());
+    expectTrue(targets.includes('deb'), 'linux.target 里没有 deb', JSON.stringify(linux, null, 2));
+    const author = pkg.author;
+    const email = author && typeof author === 'object' ? author.email : null;
+    const maintainer = linux.maintainer || null;
+    expectTrue(
+      (typeof email === 'string' && email.includes('@')) || (typeof maintainer === 'string' && maintainer.includes('@')),
+      'deb 目标缺少 maintainer',
+      `author=${JSON.stringify(author)}\nlinux.maintainer=${JSON.stringify(maintainer)}\n` +
+      "electron-builder 会报 Please specify author 'email' in the application package.json，" +
+      '而 AppImage 那一半照样成功 —— 所以症状是「Linux 只出了 1 个产物」，不是「构建全挂」。'
+    );
+    return `deb 在 target 里，maintainer=${maintainer || email}`;
+  }],
+
   ['文档：AGENTS.md 存在且不超过 200 行', () => {
     const text = readIfExists('AGENTS.md');
     const n = text.split('\n').length;
