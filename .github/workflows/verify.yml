@@ -1,8 +1,8 @@
 name: verify
 
 # 只挂 push。挂 pull_request 会让每次推送跑两遍，而回写那个 job 本来就会
-# 从 commit 反查 PR。这里**没有任何 job 级 if**：条件写歪会让 job 静默永不
-# 执行，而所有 run 依然全绿。快闸门有一条断言在守这件事。
+# 从 commit 反查 PR。这里**只有 summary 与 attest 带 job 级 if**：条件写歪会让
+# job 静默永不执行，而所有 run 依然全绿。快闸门有一条枚举式断言在守这件事。
 #
 # branches 是 ['**']，包括 release/** —— 发布分支上也要先过一遍全套闸门。
 # 快闸门有一条断言在守这个范围，别改窄。
@@ -161,14 +161,21 @@ jobs:
 
   # ==========================================================================
   # 回写不在这里。它是 supercubegame/ci-workflows 里的一份文件，image-grabber
-  # 和 jumpwow 用的是同一份，release.yml 也用同一份。
+  # 和 jumpwow 用的是同一份，另外三条流水线也用同一份。
+  #
+  # **钉在 SHA 上，不许 @main。** 那是一个可变的引用：上游改一行就会悄悄改掉
+  # 这四条流水线的行为，而回写坏掉的表现是「闸门全绿但没人看得到结论」——
+  # 已知最安静的一种失效。快闸门断言这里必须是 40 位 SHA，而且四份 workflow
+  # 只能钉同一个（只更新一半也要红）。
+  #
+  # 上游有值得跟的改动时，手动 bump 这个 SHA 并读一遍 diff。这是有意的摩擦。
   #
   # 那个 job 里每一条不寻常的设计（不 checkout、兜底评论前置、取脚本和回写都
   # 带重试、降级报告自己说明自己是降级的）都写在那份文件的头部注释里。
   # 短版本：曾经有一次两条闸门全绿，而那次提交上一条评论都没有。
   #
-  # 快闸门断言下面这行 uses、这个 job 永远不许自己长出 steps、以及 gates 里
-  # 带的是真实的 needs.*.result。
+  # 快闸门还断言这个 job 永远不许自己长出 steps、以及 gates 里带的是真实的
+  # needs.*.result。
   # ==========================================================================
   summary:
     name: 回报结果
@@ -177,10 +184,60 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
     with:
       node-version: '20'
       gates: '[{"name":"快闸门","result":"${{ needs.fast.result }}"},{"name":"Electron 端到端闸门","result":"${{ needs.e2e.result }}"},{"name":"性能压测闸门","result":"${{ needs.perf.result }}"},{"name":"三平台打包闸门","result":"${{ needs.pack.result }}"}]'
       composer-files: scripts/compose-report.mjs scripts/lib/report.mjs scripts/lib/compose.mjs
       composer-entry: scripts/compose-report.mjs
       marker: '<!-- todox-verify -->'
+
+  # ==========================================================================
+  # 事后核对。钉住 SHA 只解决「上游悄悄变了」,不解决「这一次到底送出去了没有」。
+  #
+  # 这个 job 回头去 API 上找那条带 marker 的评论，并且把结论钉在**本次运行**上
+  # （正文里必须含本次短 SHA 与 run id）。「存在一条带 marker 的评论」是幂等
+  # 写入的经典假绿：上一次留下的那条完全满足它。
+  #
+  # 它是从外面看的：红了会在提交上留一个红勾,不需要先读到评论才知道评论没来。
+  #
+  # if: always() 是必须的：summary 挂了才最需要它跑。这也是它被快闸门那条
+  # 枚举式断言列进 ALWAYS 名单的原因。
+  #
+  # 日志和产物**故意不叫** stdout-<slug>.log / report-*：那两个命名空间由 GATES
+  # 定义，attest 不是一条被合成进报告的闸门（它跑在报告写完之后）。占用它们
+  # 会让「产物名与 GATES 相等」那两条断言红在命名上，而那是假红。
+  # ==========================================================================
+  attest:
+    name: 回写送达核对
+    if: always()
+    needs: [summary]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 核对回写评论真的送达
+        id: attest
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/attest-comment.mjs 2>&1 | tee test/artifacts/attest.log
+      - name: 上传核对结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: attest-log
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 核对失败则失败
+        if: steps.attest.outcome == 'failure'
+        run: exit 1

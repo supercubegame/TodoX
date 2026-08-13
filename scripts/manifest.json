@@ -1,10 +1,12 @@
 {
   "_": "每条闸门的检查条数。等号断言，不是下限 - 下限会自己漂，加一条少一条都不会红。",
-  "fast": 57,
+  "fast": 58,
   "e2e": 21,
   "perf": 11,
   "pack": 4,
   "dist": 6,
   "release": 6,
-  "releaseMirror": 8
+  "releaseMirror": 8,
+  "attest": 7,
+  "_attest": "回写送达核对。它不在 GATES 里 - 它跑在报告写完之后，不是一条被合成进那条评论的闸门。"
 }

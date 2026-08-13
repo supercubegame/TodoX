@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 快闸门：零依赖，几十秒出结果。断言纯核心的真实行为 + 一批静态不变量 +
-// CI 配置自审（假绿、沉默通道、清单漂移、触发策略）。
+// CI 配置自审（假绿、沉默通道、清单漂移、触发策略、回写钉住）。
 //
 // 每一条断言都问过同一个问题：如果这个功能完全没实现，这条会不会失败？
 // 不会失败的就是空断言，不许留在这里。
@@ -108,6 +108,28 @@ function stripComments(src) {
   return out;
 }
 
+// YAML 版的剥注释。实测踩过：workflow 里一句说明注释里写着 stdout-<slug>.log，
+// 于是「日志名集合等于 GATES」那条断言的实际集合里多出一个字面量 <slug>——
+// 和纯度扫描第一次被自己的「别往里塞 Date.now()」注释抓到，是同一个形状。
+// **扫描器该先剥注释**，而不是反过来去改注释迁就扫描器（那是拿产品迁就尺子）。
+//
+// 引号感知，而且只把「行首或前面是空白」的 # 当注释起点 —— YAML 本身就是
+// 这个规矩，URL 片段和 foo#bar 这类写法不该被切掉。
+function stripYamlComments(text) {
+  return text.split('\n').map(line => {
+    let out = '';
+    let quote = null;
+    for (let i = 0; i < line.length; i += 1) {
+      const c = line[i];
+      if (quote) { out += c; if (c === quote) quote = null; continue; }
+      if (c === '"' || c === "'") { quote = c; out += c; continue; }
+      if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+}
+
 // ---------------------------------------------------------------- 核心与夹具
 let core = null;
 function getCore() {
@@ -140,14 +162,29 @@ function sample() {
 // 成为期望**：实际存在的文件集合必须等于这张表。实测有效 —— 加 mirror.yml 那次
 // 就是它当场抓住的。
 const WF = {
-  verify: { path: '.github/workflows/verify.yml', text: null },
-  release: { path: '.github/workflows/release.yml', text: null },
-  screenshots: { path: '.github/workflows/screenshots.yml', text: null },
-  mirror: { path: '.github/workflows/mirror.yml', text: null }
+  verify: { path: '.github/workflows/verify.yml', text: null, bare: null },
+  release: { path: '.github/workflows/release.yml', text: null, bare: null },
+  screenshots: { path: '.github/workflows/screenshots.yml', text: null, bare: null },
+  mirror: { path: '.github/workflows/mirror.yml', text: null, bare: null }
 };
 function wf(key) {
   if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
   return WF[key].text;
+}
+// 剥掉注释的那份，给「集合相等」类断言用。**剥完先自证**：剥成空字符串的话，
+// 后面每条集合断言都会免费通过（空集合等于空集合）。
+function bare(key) {
+  if (WF[key].bare == null) {
+    const stripped = stripYamlComments(wf(key));
+    for (const need of ['jobs:', 'runs-on:', 'uses:']) {
+      expectTrue(stripped.includes(need), `剥注释后 ${WF[key].path} 里连 ${need} 都没了`,
+        `原文 ${wf(key).length} 字节 -> 剥后 ${stripped.length} 字节，扫描器坏了`);
+    }
+    const lines = stripped.split('\n').filter(l => l.trim() !== '').length;
+    expectTrue(lines >= 20, `剥注释后 ${WF[key].path} 只剩 ${lines} 行非空内容，扫描器坏了`);
+    WF[key].bare = stripped;
+  }
+  return WF[key].bare;
 }
 
 function onBlock(text) {
@@ -163,6 +200,10 @@ function onBlock(text) {
   return out;
 }
 
+// 注意：一个 job 之前的注释块会被算进**上一个** job 的 lines 里。所以任何
+// 「这个 job 的文本里不该出现 X」的断言都必须去读具体那一行（needs / uses），
+// 不能对整段做子串匹配。实测踩过：attest 之前那段说明注释里反复提到 attest，
+// 于是「summary 的 needs 里不许有 attest」误报成环。
 function jobBlocks(text) {
   const lines = text.split('\n');
   const start = lines.findIndex(l => l.trimEnd() === 'jobs:');
@@ -178,6 +219,11 @@ function jobBlocks(text) {
   }
   for (const j of jobs.values()) j.text = j.lines.join('\n');
   return jobs;
+}
+function needsOf(job) {
+  const line = job.lines.find(l => l.trim().startsWith('needs:'));
+  if (!line) return null;
+  return line.replace(/.*\[/, '').replace(/\].*/, '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
 // job 级 if 只出现在缩进 4 空格的位置。step 级的 if 缩进更深，不算。
@@ -217,13 +263,17 @@ function expandMatrix(text, token) {
   }
   return matrixSlugs(text).map(s => token.split('${{matrix.slug}}').join(s));
 }
-function tokenSet(text, re) {
+// 只吃剥过注释的文本。说明注释里提到一个产物名或日志名是文档，不是配置。
+function tokenSet(key, re) {
+  const text = bare(key);
   const out = new Set();
   for (const m of text.matchAll(re)) for (const v of expandMatrix(text, m[1])) out.add(v);
   return out;
 }
 const RE_REPORT = /name:\s*(report-[^\s]+)/g;
 const RE_STDOUT = /stdout-([^\s`'"]+?)\.log/g;
+// 回写那行的引用。@ 后面必须是 40 位十六进制，不许是分支或 tag —— 见那条断言。
+const RE_WRITEBACK = /uses:\s*supercubegame\/ci-workflows\/\.github\/workflows\/report\.yml@([^\s]+)/g;
 
 // ---------------------------------------------------------------- 检查清单
 const report = new Report('快闸门（纯核心 + 静态断言）');
@@ -708,8 +758,13 @@ const CHECKS = [
     const registered = Object.values(WF).map(w => path.basename(w.path)).sort();
     expectEq(actual, registered, '已登记的 workflow 集合');
     // 登记了但文件是空的也要红，否则 wf() 会在别的断言里抛一个看不懂的错。
-    for (const key of Object.keys(WF)) expectTrue(wf(key).length > 0, `${WF[key].path} 是空文件`);
-    return `${actual.length} 份 workflow 全部在扫描范围内：${actual.join(', ')}`;
+    // 顺手把剥注释那份也建出来并自证一遍（bare 内部会断言剥完还剩真东西）。
+    for (const key of Object.keys(WF)) {
+      expectTrue(wf(key).length > 0, `${WF[key].path} 是空文件`);
+      bare(key);
+    }
+    const kept = Object.keys(WF).map(k => `${path.basename(WF[k].path)} ${wf(k).length}->${bare(k).length}`);
+    return `${actual.length} 份 workflow 全部在扫描范围内，剥注释后都自证通过：${kept.join('，')}`;
   }],
 
   ['CI：所有 workflow 里出现 tee 的脚本块都设置了 pipefail', () => {
@@ -729,27 +784,45 @@ const CHECKS = [
     return `${Object.keys(WF).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
   }],
 
-  ['CI：report job 用共享 workflow，且没有自己长出 steps', () => {
+  // 这条原来逐字核对 `report.yml@main`。**@main 是可变引用**：上游改一行就会
+  // 悄悄改掉这四条流水线的行为，而回写坏掉的表现是「闸门全绿但没人看得到
+  // 结论」—— 已知最安静的一种失效，实测发生过一次。
+  //
+  // 现在要求 40 位 SHA，并且**四份 workflow 钉的 SHA 集合大小必须为 1**：
+  // 只更新一半比全钉 @main 更糟，两边行为会分叉而没有任何断言看得见。
+  ['CI：回写 job 用共享 workflow、钉在 40 位 SHA、四份钉同一个、本地零 steps', () => {
     const bad = [];
+    const pins = new Set();
     for (const key of Object.keys(WF)) {
-      const jobs = jobBlocks(wf(key));
+      const jobs = jobBlocks(bare(key));
       const j = jobs.get('summary');
       expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job —— 送不出结论的闸门等于没跑`, [...jobs.keys()].join(','));
-      if (!j.text.includes('uses: supercubegame/ci-workflows/.github/workflows/report.yml@main')) bad.push(`${WF[key].path} 没有引用共享回写 workflow`);
+      const refs = [...j.text.matchAll(RE_WRITEBACK)].map(m => m[1]);
+      if (refs.length !== 1) {
+        bad.push(`${WF[key].path} 引用共享回写 workflow 的次数是 ${refs.length}，应该恰好 1 次`);
+        continue;
+      }
+      const ref = refs[0];
+      // 明确拒绝分支与 tag 形状的引用，而不只是「不等于 main」——
+      // 后者会放过 @v1 / @latest 这类同样可变的写法。
+      if (!/^[0-9a-f]{40}$/.test(ref)) {
+        bad.push(`${WF[key].path} 把回写钉在 ${ref} 上，不是 40 位 SHA（分支和 tag 都是可变引用）`);
+      }
+      pins.add(ref);
       if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
     }
     expectEq(bad, [], '回写 job 的问题');
-    return `${Object.keys(WF).length} 份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps`;
+    expectEq(pins.size, 1, '四份 workflow 钉住的 SHA 个数（多于一个说明只更新了一半）');
+    return `${Object.keys(WF).length} 份 workflow 全部钉在 ${[...pins][0].slice(0, 7)}，本地零 steps`;
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
     const summary = [];
     for (const key of Object.keys(WF)) {
-      const jobs = jobBlocks(wf(key));
+      const jobs = jobBlocks(bare(key));
       const j = jobs.get('summary');
-      const needsLine = j.lines.find(l => l.trim().startsWith('needs:'));
-      expectTrue(Boolean(needsLine), `${WF[key].path} 的 summary 没有 needs`, j.text.slice(0, 400));
-      const needs = needsLine.replace(/.*\[/, '').replace(/\].*/, '').split(',').map(s => s.trim()).filter(Boolean);
+      const needs = needsOf(j);
+      expectTrue(needs !== null, `${WF[key].path} 的 summary 没有 needs`, j.text.slice(0, 400));
       const gatesLine = j.lines.find(l => l.trim().startsWith('gates:'));
       expectTrue(Boolean(gatesLine), `${WF[key].path} 的 summary 没有 gates 输入`, j.text.slice(0, 400));
       const refs = [...gatesLine.matchAll(/needs\.([A-Za-z0-9_-]+)\.result/g)].map(m => m[1]);
@@ -762,29 +835,82 @@ const CHECKS = [
   }],
 
   ['CI：verify 上传的 report-* 产物集合与 GATES 一致', () => {
-    const names = tokenSet(wf('verify'), RE_REPORT);
+    const names = tokenSet('verify', RE_REPORT);
     const want = new Set(GATES.map(g => `report-${g.slug}`));
     expectEq([...names].sort(), [...want].sort(), '产物名集合');
-    return `${names.size} 个产物名与 GATES 一一对应`;
+    return `${names.size} 个产物名与 GATES 一一对应（扫的是剥掉注释的那份）`;
   }],
 
   ['CI：verify 的 stdout-<slug>.log 集合与 GATES 一致', () => {
-    const slugs = tokenSet(wf('verify'), RE_STDOUT);
+    const slugs = tokenSet('verify', RE_STDOUT);
     const want = new Set(GATES.map(g => g.slug));
     expectEq([...slugs].sort(), [...want].sort(), 'stdout 日志 slug 集合');
     return `${slugs.size} 条日志与 GATES 一一对应，composer 不会去找一个没人产出的 slug`;
   }],
 
-  ['CI：verify 的闸门 job 上没有 job 级 if（不会静默不跑）', () => {
-    const jobs = jobBlocks(wf('verify'));
-    const offenders = [];
+  // 这条原来是「闸门 job 上一个 job 级 if 都不许有」，名单里手工排除了 summary。
+  // 加 attest 的时候它会立刻误报 —— 和「手写清单追不上目录」是同一个形状。
+  // 改成枚举式：每个 job 必须落进两类之一，新加 job 自动被覆盖。
+  ['CI：verify 的每个 job 要么无条件执行，要么显式 always()（枚举即期望）', () => {
+    const jobs = jobBlocks(bare('verify'));
+    expectTrue(jobs.size >= 6, 'verify.yml 的 job 数量少于预期 —— 是扫描器坏了，不是配置对了', [...jobs.keys()].join(','));
+    // 这两个必须 always：上游炸了它们也要跑。summary 要如实报「闸门挂了」，
+    // attest 要如实报「结论没送达」—— 静默跳过和「一切正常」在面板上一模一样。
+    const ALWAYS = ['summary', 'attest'];
+    for (const n of ALWAYS) expectTrue(jobs.has(n), `verify.yml 里没有 ${n} job`, [...jobs.keys()].join(','));
+    const problems = [];
     for (const [name, j] of jobs) {
-      if (name === 'summary') continue;
-      for (const l of jobLevelIfs(j)) offenders.push(`${name}: ${l}`);
+      const ifs = jobLevelIfs(j);
+      if (ALWAYS.includes(name)) {
+        // 负向那侧：名单里的 job 丢了 always() 也要红。
+        if (!ifs.some(l => /^if:\s*always\(\)$/.test(l))) problems.push(`${name} 应该带 if: always()，实际：${ifs.join(' / ') || '（没有任何 if）'}`);
+      } else if (ifs.length > 0) {
+        // 其余一律不许有条件：写歪会让 job 静默永不执行，而 run 依然全绿。
+        problems.push(`${name} 不该有 job 级 if，实际：${ifs.join(' / ')}`);
+      }
     }
-    expectEq(offenders, [], '带 job 级 if 的闸门 job');
-    expectTrue(jobs.size >= 4, 'job 数量少于预期', [...jobs.keys()].join(','));
-    return `${jobs.size - 1} 条闸门 job 全部无条件执行 —— 条件写歪会让 job 静默永不执行，而 run 依然全绿`;
+    expectEq(problems, [], 'job 条件的问题');
+    const plain = [...jobs.keys()].filter(n => !ALWAYS.includes(n));
+    return `${jobs.size} 个 job：${plain.join(' / ')} 无条件执行，${ALWAYS.join(' / ')} 带 always() —— 新加 job 会自动落进这条断言`;
+  }],
+
+  // 钉住 SHA 只解决「上游悄悄变了」，不解决「这一次到底送出去了没有」。
+  // attest 是那件事的答案：它跑在 summary 之后，回头去 API 上找那条评论。
+  // 这条静态断言守的是「它还在、还接着、marker 还对得上」——
+  // 一个被误删或改歪的核对 job，会让回写通道重新变成沉默通道。
+  //
+  // 注意这里**只读具体那一行**（needs / uses / marker），不对整段 job 文本做
+  // 子串匹配：jobBlocks 会把一个 job 之前的注释块算进上一个 job，而那段注释
+  // 里反复提到 attest。实测就是这么误报成「环」的。
+  ['CI：verify 有回写送达核对 job，marker 两处一致且不占用报告命名空间', () => {
+    const text = bare('verify');
+    const jobs = jobBlocks(text);
+    const j = jobs.get('attest');
+    expectTrue(Boolean(j), 'verify.yml 里没有 attest job —— 回写坏掉时没有任何东西在喊', [...jobs.keys()].join(','));
+    const needs = needsOf(j);
+    expectTrue(needs !== null && needs.includes('summary'), 'attest 必须 needs summary —— 评论还没写就去找它，等的是时序不是真相', j.text.slice(0, 300));
+    expectTrue(j.text.includes('scripts/attest-comment.mjs'), 'attest job 没有真的执行核对脚本', j.text.slice(0, 400));
+    // 它也不许被塞进 summary 的 needs：那会造出一个环。只看 needs 那一行。
+    const summaryNeeds = needsOf(jobs.get('summary')) || [];
+    expectTrue(!summaryNeeds.includes('attest'), 'summary 的 needs 里出现了 attest —— 那是个环', summaryNeeds.join(','));
+
+    // marker 是两处耦合的字符串。改了一处而没改另一处，核对会去找一个没人写的
+    // marker，然后每次都红在一个看起来像「评论没送达」的地方 —— 根因其实在这里。
+    const markerLine = /marker:\s*'([^']+)'/.exec(jobs.get('summary').text);
+    expectTrue(Boolean(markerLine), '扫不到 summary 的 marker —— 是扫描器坏了，不是配置对了', jobs.get('summary').text.slice(0, 400));
+    const script = readIfExists('scripts/attest-comment.mjs');
+    expectTrue(script.includes(`'${markerLine[1]}'`), 'attest 脚本里的 marker 与 workflow 不一致',
+      `workflow: ${markerLine[1]}\n核对脚本里找不到这个字面量。两处必须逐字相同。`);
+
+    // attest 不是一条被合成进报告的闸门（它跑在报告写完之后），所以不许占用
+    // stdout-<slug>.log 与 report-* 这两个由 GATES 定义的命名空间 ——
+    // 占用会让上面那两条「集合相等」的断言红在命名上，而那是假红。
+    // 这里扫的是剥过注释的那份，所以说明文字里提到它们不算违规。
+    expectTrue(!tokenSet('verify', RE_STDOUT).has('attest'), 'attest 的日志占用了 stdout-<slug>.log 命名空间（那个集合由 GATES 定义）');
+    expectTrue(!tokenSet('verify', RE_REPORT).has('report-attest'), 'attest 的产物占用了 report-* 命名空间（同上）');
+    expectTrue(j.text.includes('attest.log'), 'attest 没有把输出 tee 成日志 —— 失败时读不到原因');
+    expectTrue(MANIFEST.attest > 0, 'manifest 里没有登记 attest 的条数', JSON.stringify(MANIFEST));
+    return `attest needs [${needs.join(',')}]，执行 attest-comment.mjs（${MANIFEST.attest} 条核对），marker ${markerLine[1]} 两处一致，未占用 report-* / stdout-*`;
   }],
 
   ['CI：release 只在 release/** 上触发，而 verify 覆盖所有分支（双向）', () => {
@@ -825,10 +951,10 @@ const CHECKS = [
   // 那就是同一个漏继承又长了一遍。少了它，composer 会去找一个没人产出的 slug，
   // 然后报告里只剩一句「没有产出报告」。
   ['CI：screenshots 的产物名与 stdout 日志集合等于 SHOTS_GATES', () => {
-    const names = tokenSet(wf('screenshots'), RE_REPORT);
+    const names = tokenSet('screenshots', RE_REPORT);
     const wantNames = new Set(SHOTS_GATES.map(g => `report-${g.slug}`));
     expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
-    const slugs = tokenSet(wf('screenshots'), RE_STDOUT);
+    const slugs = tokenSet('screenshots', RE_STDOUT);
     const wantSlugs = new Set(SHOTS_GATES.map(g => g.slug));
     expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
     return `${names.size} 个产物 + ${slugs.size} 条日志，与 SHOTS_GATES 完全相等`;
@@ -851,28 +977,28 @@ const CHECKS = [
     expectTrue(text.includes('MIRROR_TOKEN:-') && text.includes('exit 1'), 'mirror.yml 没有在令牌缺失时明确失败', '静默跳过就等于「以为同步了，其实什么都没发生」');
     expectTrue(text.includes('git push --force'), 'mirror.yml 不是强推 —— 公开仓可能留下私有历史', text.slice(0, 400));
     expectTrue(text.includes('${GITHUB_SHA:0:7}'), '同步的提交信息里没有源 SHA', '那是审计唯一能区分「同步成功」与「镜像早就停在旧内容上」的凭据');
-    const names = tokenSet(text, RE_REPORT);
+    const names = tokenSet('mirror', RE_REPORT);
     expectEq([...names].sort(), MIRROR_GATES.map(g => `report-${g.slug}`).sort(), '产物名集合');
-    const slugs = tokenSet(text, RE_STDOUT);
+    const slugs = tokenSet('mirror', RE_STDOUT);
     expectEq([...slugs].sort(), MIRROR_GATES.map(g => g.slug).sort(), 'stdout 日志 slug 集合');
     return '只认 main，令牌缺失即红，强推 + 源 SHA 痕迹都在，产物名与 MIRROR_GATES 相等';
   }],
 
   ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
-    const slugs = matrixSlugs(wf('release')).slice().sort();
+    const slugs = matrixSlugs(bare('release')).slice().sort();
     const want = RELEASE_GATES.map(g => g.slug).filter(s => s.startsWith('dist-')).sort();
     expectEq(slugs, want, 'matrix slug 集合');
-    const oses = [...wf('release').matchAll(/^\s*- os:\s*([^\s]+)\s*$/gm)].map(m => m[1]);
+    const oses = [...bare('release').matchAll(/^\s*- os:\s*([^\s]+)\s*$/gm)].map(m => m[1]);
     expectEq(oses.length, 3, 'runner 数量');
     expectEq(new Set(oses).size, 3, '互不相同的 runner 数量');
     return `${slugs.join(' / ')} 跑在 ${oses.join(' / ')} 上 —— 少一个平台就红，不是「至少三个」`;
   }],
 
   ['CI：release 的产物名与 stdout 日志集合都等于 RELEASE_GATES', () => {
-    const names = tokenSet(wf('release'), RE_REPORT);
+    const names = tokenSet('release', RE_REPORT);
     const wantNames = new Set(RELEASE_GATES.map(g => `report-${g.slug}`));
     expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
-    const slugs = tokenSet(wf('release'), RE_STDOUT);
+    const slugs = tokenSet('release', RE_STDOUT);
     const wantSlugs = new Set(RELEASE_GATES.map(g => g.slug));
     expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
     return `${names.size} 个产物 + ${slugs.size} 条日志，与 RELEASE_GATES 完全相等`;
@@ -883,7 +1009,7 @@ const CHECKS = [
   // 是同一个形状，一小时内长了第二遍。所以改成枚举即期望：
   // release.yml 里**每一个** job 都必须落进这两类之一。
   ['CI：release 的每个 job 要么无条件执行，要么显式 always()（枚举即期望）', () => {
-    const jobs = jobBlocks(wf('release'));
+    const jobs = jobBlocks(bare('release'));
     expectTrue(jobs.size >= 5, 'release.yml 的 job 数量少于预期 —— 是扫描器坏了，不是配置对了', [...jobs.keys()].join(','));
     // 这两个必须 always：上游炸了它们也要跑，然后如实报「读不到 Release」。
     // 静默跳过和「验过了没问题」在面板上长得一模一样。
