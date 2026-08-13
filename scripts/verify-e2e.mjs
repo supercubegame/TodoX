@@ -69,6 +69,7 @@ const diag = () => ctx.page.evaluate(() => JSON.parse(JSON.stringify({
   rendered: window.__DIAG__.rendered,
   renderCount: window.__DIAG__.renderCount,
   settings: window.__DIAG__.settings,
+  history: window.__DIAG__.history,
   view: window.__DIAG__.view,
   lastError: window.__DIAG__.lastError
 })));
@@ -142,9 +143,12 @@ const STEPS = [
 
   ['诊断出口：字段齐全且只读', async () => {
     const d = await diag();
-    for (const k of ['ready', 'counts', 'rendered', 'renderCount', 'settings', 'view']) {
+    for (const k of ['ready', 'counts', 'rendered', 'renderCount', 'settings', 'history', 'view']) {
       expectTrue(k in d, `__DIAG__ 缺字段 ${k}`, JSON.stringify(d));
     }
+    // 刚启动时历史必须是空的：能撤销回一个用户没见过的状态，那不是撤销是惊吓。
+    expectEq(d.history.canUndo, false, '刚启动时的 canUndo');
+    expectEq(d.history.canRedo, false, '刚启动时的 canRedo');
     const tamper = await ctx.page.evaluate(() => {
       const frozen = Object.isFrozen(window.__DIAG__);
       try { window.__DIAG__ = { ready: false }; } catch (e) { /* 严格模式会抛，也算守住了 */ }
@@ -153,7 +157,7 @@ const STEPS = [
       return { frozen, stillReady: window.__DIAG__.ready === true, totalAfter: window.__DIAG__.counts.total };
     });
     expectEq(tamper, { frozen: true, stillReady: true, totalAfter: 0 }, '篡改 __DIAG__ 的结果');
-    return '6 个字段齐全，整体冻结，counts 返回副本（改副本改不动本体）';
+    return '7 个字段齐全，整体冻结，counts 返回副本（改副本改不动本体）；初始不可撤销';
   }],
 
   ['新增：连续添加 3 条，DOM 行数与计数器都为 3', async () => {
@@ -174,8 +178,10 @@ const STEPS = [
     expectEq(await rowCount(), 3, '行数');
     const d = await diag();
     expectEq(d.lastError && d.lastError.code, 'EMPTY_TITLE', '错误码');
+    // 失败的尝试不该占一格撤销 —— 撤销深度必须还是 3（三次成功的新增）。
+    expectEq(d.history.undoDepth, 3, '失败尝试之后的撤销深度');
     await t('new-title').fill('');
-    return '行数仍是 3，错误码 EMPTY_TITLE 并且真的显示出来了';
+    return '行数仍是 3，错误码 EMPTY_TITLE 并且真的显示出来了；失败没有占用撤销格';
   }],
 
   ['渲染证据：有列表时探针像素 > 0，空列表时为 0（负向孪生）', async () => {
@@ -281,6 +287,58 @@ const STEPS = [
     return '关掉之后一步删除，确认框始终没出现';
   }],
 
+  // ---------------------------------------------------------------- 撤销
+  ['撤销：点按钮后被删的那条回来，标题重新出现 1 次', async () => {
+    const before = await diag();
+    expectEq(before.history.canUndo, true, '撤销按钮该可用');
+    expectEq(await t('undo').isDisabled(), false, '撤销按钮的 disabled');
+    // 重做此刻不该可用 —— 还没撤销过任何东西。
+    expectEq(await t('redo').isDisabled(), true, '重做按钮的 disabled');
+    await t('undo').click();
+    await waitFor('行数回到 2', async () => (await rowCount()) === 2);
+    // 负向孪生的反面用法：刚才断言过它是 0 次，现在必须恰好 1 次。
+    expectEq(await titleOccurrences('写月报'), { inTitles: 1, inBody: 1 }, '被删标题撤销后的出现次数');
+    const after = await diag();
+    expectEq(after.history.canRedo, true, '撤销之后 canRedo');
+    expectEq(after.counts.total, 2, '撤销后的总数');
+    // 撤销不该把设置一起拖回去：上一次改动是删除，不是改设置。
+    expectEq(after.settings.confirmDelete, false, '撤销后的 confirmDelete');
+    return `1 行 -> 2 行，「写月报」重新出现 1 次，撤销深度 ${after.history.undoDepth}，设置未受影响`;
+  }],
+
+  ['重做：点按钮后又删掉，标题回到 0 次', async () => {
+    expectEq(await t('redo').isDisabled(), false, '重做按钮的 disabled');
+    await t('redo').click();
+    await waitFor('行数回到 1', async () => (await rowCount()) === 1);
+    expectEq(await titleOccurrences('写月报'), { inTitles: 0, inBody: 0 }, '重做后被删标题的出现次数');
+    const d = await diag();
+    expectEq(d.history.canRedo, false, '重做用完之后 canRedo');
+    expectEq(await t('redo').isDisabled(), true, '重做用完之后按钮的 disabled');
+    return `2 行 -> 1 行，标题回到 0 次，重做链用完（canRedo=false，按钮变灰）`;
+  }],
+
+  ['快捷键：Ctrl+Z 生效，但在输入框里不抢文本框的撤销（负向）', async () => {
+    // 先把焦点放到不是输入框的地方。
+    await t('filter-all').click();
+    await waitFor('仍是 1 行', async () => (await rowCount()) === 1);
+    await ctx.page.keyboard.press('Control+z');
+    await waitFor('快捷键撤销后 2 行', async () => (await rowCount()) === 2);
+    await ctx.page.keyboard.press('Control+Shift+z');
+    await waitFor('快捷键重做后 1 行', async () => (await rowCount()) === 1);
+
+    // 负向那侧：焦点在输入框里时，Ctrl+Z 该归文本框自己。抢走它会让打字
+    // 变成危险的事 —— 改了半行标题，一个 Ctrl+Z 把上一次删除恢复了。
+    await t('new-title').fill('随手打几个字');
+    await t('new-title').focus();
+    const depthBefore = (await diag()).history.undoDepth;
+    await ctx.page.keyboard.press('Control+z');
+    await new Promise(r => setTimeout(r, 400));
+    expectEq(await rowCount(), 1, '输入框里按 Ctrl+Z 之后的行数');
+    expectEq((await diag()).history.undoDepth, depthBefore, '输入框里按 Ctrl+Z 之后的撤销深度');
+    await t('new-title').fill('');
+    return '窗口焦点下 Ctrl+Z / Ctrl+Shift+Z 都生效；输入框里按 Ctrl+Z 行数与撤销深度都不动';
+  }],
+
   ['窗口：可调整大小、最小尺寸 480x360、resize 到 1024x720 真的生效', async () => {
     const info = await ctx.app.evaluate(({ BrowserWindow }) => {
       const w = BrowserWindow.getAllWindows()[0];
@@ -298,7 +356,7 @@ const STEPS = [
     return `原尺寸 ${info.bounds.width}x${info.bounds.height} -> 1024x720，最小 480x360，可调整`;
   }],
 
-  ['重启：待办、设置、窗口尺寸全部恢复', async () => {
+  ['重启：待办、设置、窗口尺寸全部恢复，而历史清空', async () => {
     const beforeDiag = await diag();
     await ctx.app.close();
     await new Promise(r => setTimeout(r, 800));
@@ -308,13 +366,15 @@ const STEPS = [
     expectEq(await rowCount(), 1, '重启后的行数');
     expectEq(await rows().nth(0).locator('[data-testid="item-title"]').textContent(), '买牛奶', '幸存待办的标题');
     expectEq(after.settings, { theme: 'dark', fontScale: 160, confirmDelete: false, defaultPriority: 'normal', defaultSort: 'created' }, '重启后的设置');
+    // 历史**不该**跨重启：它不进存档，而且撤销回一个用户没见过的状态是惊吓。
+    expectEq(after.history, { canUndo: false, canRedo: false, undoDepth: 0, redoDepth: 0, limit: after.history.limit }, '重启后的历史摘要');
     const b = await ctx.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getBounds());
     expectTrue(Math.abs(b.width - 1024) <= 4 && Math.abs(b.height - 720) <= 4, '窗口尺寸没有恢复', `期望 ~1024x720，实际 ${b.width}x${b.height}`);
     await ctx.page.screenshot({ path: path.join(ARTIFACTS, 'screen-restart.png') });
-    return `1 条待办 + 深色 + 160% + 关闭确认 + ${b.width}x${b.height} 全部恢复`;
+    return `1 条待办 + 深色 + 160% + 关闭确认 + ${b.width}x${b.height} 全部恢复；历史归零（上限 ${after.history.limit}）`;
   }],
 
-  ['落盘证据：存档文件存在、字节数 > 0、内容对得上', async () => {
+  ['落盘证据：存档文件存在、字节数 > 0、内容对得上且不含历史', async () => {
     expectTrue(fs.existsSync(DATA_FILE), '存档文件根本不存在', DATA_FILE);
     const bytes = fs.statSync(DATA_FILE).size;
     expectTrue(bytes > 0, '存档文件是空的', `${DATA_FILE} = ${bytes} 字节`);
@@ -323,7 +383,9 @@ const STEPS = [
     expectEq(raw.settings.theme, 'dark', '落盘的主题');
     expectEq([raw.bounds.width, raw.bounds.height], [1024, 720], '落盘的窗口尺寸');
     expectEq(raw.todos.filter(x => x.title === '遛狗').length, 0, '被删条目在磁盘上的残留');
-    return `${bytes} 字节，标题/设置/尺寸都对，被删的条目磁盘上也没有（验产物，不验接口被调用过）`;
+    // 历史里每一项都是一份完整状态，写进磁盘会让存档膨胀几十倍。
+    expectEq(Object.keys(raw).sort(), ['bounds', 'settings', 'todos', 'version'], '存档的顶层字段');
+    return `${bytes} 字节，标题/设置/尺寸都对，被删的条目磁盘上也没有，顶层只有 4 个字段（无 history）`;
   }],
 
   ['全程零控制台错误', async () => {
