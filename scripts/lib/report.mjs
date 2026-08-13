@@ -31,9 +31,17 @@ export const RELEASE_GATES = [
 //
 // 它一开始没有回写 job，于是第一次失败时报告只存在于 CI 日志里 —— 而那正是
 // agent 读不到的地方。从仓库外面看，「跑了但没产出截图」和「压根没跑」长得
-// 一模一样。三条流水线现在都接同一份共享回写。
+// 一模一样。四条流水线现在都接同一份共享回写。
 export const SHOTS_GATES = [
   { slug: 'shots', label: '截图生成器' }
+];
+
+// 镜像流水线（mirror.yml）的闸门清单。
+//
+// 这条流水线的失败形态最阴：推送坏掉时公开仓还留着上一次的内容，文件树
+// 完全正确 —— 所以审计里有一条断言「那个提交必须是本次同步产生的」。
+export const MIRROR_GATES = [
+  { slug: 'mirror', label: '公开镜像同步' }
 ];
 
 export class Report {
