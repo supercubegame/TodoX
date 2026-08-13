@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 快闸门：零依赖，几十秒出结果。断言纯核心的真实行为 + 一批静态不变量 +
-// CI 配置自审（假绿、沉默通道、清单漂移、触发策略）。
+// CI 配置自审（假绿、沉默通道、清单漂移、触发策略、回写钉住）。
 //
 // 每一条断言都问过同一个问题：如果这个功能完全没实现，这条会不会失败？
 // 不会失败的就是空断言，不许留在这里。
@@ -224,6 +224,8 @@ function tokenSet(text, re) {
 }
 const RE_REPORT = /name:\s*(report-[^\s]+)/g;
 const RE_STDOUT = /stdout-([^\s`'"]+?)\.log/g;
+// 回写那行的引用。@ 后面必须是 40 位十六进制，不许是分支或 tag —— 见那条断言。
+const RE_WRITEBACK = /uses:\s*supercubegame\/ci-workflows\/\.github\/workflows\/report\.yml@([^\s]+)/g;
 
 // ---------------------------------------------------------------- 检查清单
 const report = new Report('快闸门（纯核心 + 静态断言）');
@@ -729,17 +731,36 @@ const CHECKS = [
     return `${Object.keys(WF).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
   }],
 
-  ['CI：report job 用共享 workflow，且没有自己长出 steps', () => {
+  // 这条原来逐字核对 `report.yml@main`。**@main 是可变引用**：上游改一行就会
+  // 悄悄改掉这四条流水线的行为，而回写坏掉的表现是「闸门全绿但没人看得到
+  // 结论」—— 已知最安静的一种失效，实测发生过一次。
+  //
+  // 现在要求 40 位 SHA，并且**四份 workflow 钉的 SHA 集合大小必须为 1**：
+  // 只更新一半比全钉 @main 更糟，两边行为会分叉而没有任何断言看得见。
+  ['CI：回写 job 用共享 workflow、钉在 40 位 SHA、四份钉同一个、本地零 steps', () => {
     const bad = [];
+    const pins = new Set();
     for (const key of Object.keys(WF)) {
       const jobs = jobBlocks(wf(key));
       const j = jobs.get('summary');
       expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job —— 送不出结论的闸门等于没跑`, [...jobs.keys()].join(','));
-      if (!j.text.includes('uses: supercubegame/ci-workflows/.github/workflows/report.yml@main')) bad.push(`${WF[key].path} 没有引用共享回写 workflow`);
+      const refs = [...j.text.matchAll(RE_WRITEBACK)].map(m => m[1]);
+      if (refs.length !== 1) {
+        bad.push(`${WF[key].path} 引用共享回写 workflow 的次数是 ${refs.length}，应该恰好 1 次`);
+        continue;
+      }
+      const ref = refs[0];
+      // 明确拒绝分支与 tag 形状的引用，而不只是「不等于 main」——
+      // 后者会放过 @v1 / @latest 这类同样可变的写法。
+      if (!/^[0-9a-f]{40}$/.test(ref)) {
+        bad.push(`${WF[key].path} 把回写钉在 ${ref} 上，不是 40 位 SHA（分支和 tag 都是可变引用）`);
+      }
+      pins.add(ref);
       if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
     }
     expectEq(bad, [], '回写 job 的问题');
-    return `${Object.keys(WF).length} 份 workflow 都引用 ci-workflows/report.yml@main，本地零 steps`;
+    expectEq(pins.size, 1, '四份 workflow 钉住的 SHA 个数（多于一个说明只更新了一半）');
+    return `${Object.keys(WF).length} 份 workflow 全部钉在 ${[...pins][0].slice(0, 7)}，本地零 steps`;
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
@@ -775,16 +796,63 @@ const CHECKS = [
     return `${slugs.size} 条日志与 GATES 一一对应，composer 不会去找一个没人产出的 slug`;
   }],
 
-  ['CI：verify 的闸门 job 上没有 job 级 if（不会静默不跑）', () => {
+  // 这条原来是「闸门 job 上一个 job 级 if 都不许有」，名单里手工排除了 summary。
+  // 加 attest 的时候它会立刻误报 —— 和「手写清单追不上目录」是同一个形状。
+  // 改成枚举式：每个 job 必须落进两类之一，新加 job 自动被覆盖。
+  ['CI：verify 的每个 job 要么无条件执行，要么显式 always()（枚举即期望）', () => {
     const jobs = jobBlocks(wf('verify'));
-    const offenders = [];
+    expectTrue(jobs.size >= 6, 'verify.yml 的 job 数量少于预期 —— 是扫描器坏了，不是配置对了', [...jobs.keys()].join(','));
+    // 这两个必须 always：上游炸了它们也要跑。summary 要如实报「闸门挂了」，
+    // attest 要如实报「结论没送达」—— 静默跳过和「一切正常」在面板上一模一样。
+    const ALWAYS = ['summary', 'attest'];
+    for (const n of ALWAYS) expectTrue(jobs.has(n), `verify.yml 里没有 ${n} job`, [...jobs.keys()].join(','));
+    const problems = [];
     for (const [name, j] of jobs) {
-      if (name === 'summary') continue;
-      for (const l of jobLevelIfs(j)) offenders.push(`${name}: ${l}`);
+      const ifs = jobLevelIfs(j);
+      if (ALWAYS.includes(name)) {
+        // 负向那侧：名单里的 job 丢了 always() 也要红。
+        if (!ifs.some(l => /^if:\s*always\(\)$/.test(l))) problems.push(`${name} 应该带 if: always()，实际：${ifs.join(' / ') || '（没有任何 if）'}`);
+      } else if (ifs.length > 0) {
+        // 其余一律不许有条件：写歪会让 job 静默永不执行，而 run 依然全绿。
+        problems.push(`${name} 不该有 job 级 if，实际：${ifs.join(' / ')}`);
+      }
     }
-    expectEq(offenders, [], '带 job 级 if 的闸门 job');
-    expectTrue(jobs.size >= 4, 'job 数量少于预期', [...jobs.keys()].join(','));
-    return `${jobs.size - 1} 条闸门 job 全部无条件执行 —— 条件写歪会让 job 静默永不执行，而 run 依然全绿`;
+    expectEq(problems, [], 'job 条件的问题');
+    const plain = [...jobs.keys()].filter(n => !ALWAYS.includes(n));
+    return `${jobs.size} 个 job：${plain.join(' / ')} 无条件执行，${ALWAYS.join(' / ')} 带 always() —— 新加 job 会自动落进这条断言`;
+  }],
+
+  // 钉住 SHA 只解决「上游悄悄变了」，不解决「这一次到底送出去了没有」。
+  // attest 是那件事的答案：它跑在 summary 之后，回头去 API 上找那条评论。
+  // 这条静态断言守的是「它还在、还接着、marker 还对得上」——
+  // 一个被误删或改歪的核对 job，会让回写通道重新变成沉默通道。
+  ['CI：verify 有回写送达核对 job，marker 两处一致且不占用报告命名空间', () => {
+    const text = wf('verify');
+    const jobs = jobBlocks(text);
+    const j = jobs.get('attest');
+    expectTrue(Boolean(j), 'verify.yml 里没有 attest job —— 回写坏掉时没有任何东西在喊', [...jobs.keys()].join(','));
+    const needsLine = j.lines.find(l => l.trim().startsWith('needs:'));
+    expectTrue(Boolean(needsLine) && needsLine.includes('summary'), 'attest 必须 needs summary —— 评论还没写就去找它，等的是时序不是真相', j.text.slice(0, 300));
+    expectTrue(j.text.includes('scripts/attest-comment.mjs'), 'attest job 没有真的执行核对脚本', j.text.slice(0, 400));
+
+    // marker 是两处耦合的字符串。改了一处而没改另一处，核对会去找一个没人写的
+    // marker，然后每次都红在一个看起来像「评论没送达」的地方 —— 根因其实在这里。
+    const markerLine = /marker:\s*'([^']+)'/.exec(jobs.get('summary').text);
+    expectTrue(Boolean(markerLine), '扫不到 summary 的 marker —— 是扫描器坏了，不是配置对了', jobs.get('summary').text.slice(0, 400));
+    const script = readIfExists('scripts/attest-comment.mjs');
+    expectTrue(script.includes(`'${markerLine[1]}'`), 'attest 脚本里的 marker 与 workflow 不一致',
+      `workflow: ${markerLine[1]}\n核对脚本里找不到这个字面量。两处必须逐字相同。`);
+
+    // attest 不是一条被合成进报告的闸门（它跑在报告写完之后），所以不许占用
+    // stdout-<slug>.log 与 report-* 这两个由 GATES 定义的命名空间 ——
+    // 占用会让上面那两条「集合相等」的断言红在命名上，而那是假红。
+    expectTrue(!/stdout-attest\.log/.test(text), 'attest 的日志不许叫 stdout-*.log（那个命名空间由 GATES 定义）');
+    expectTrue(!/name:\s*report-attest/.test(text), 'attest 的产物不许叫 report-*（同上）');
+    expectTrue(j.text.includes('attest.log'), 'attest 没有把输出 tee 成日志 —— 失败时读不到原因');
+    // 它也不许被塞进 summary 的 needs：那会造出一个环。
+    expectTrue(!jobs.get('summary').text.includes('attest'), 'summary 的 needs 里出现了 attest —— 那是个环', jobs.get('summary').text.slice(0, 300));
+    expectEq(MANIFEST.attest > 0, true, 'manifest 里 attest 的条数');
+    return `attest needs summary，执行 attest-comment.mjs（${MANIFEST.attest} 条核对），marker ${markerLine[1]} 两处一致，未占用 report-* / stdout-*`;
   }],
 
   ['CI：release 只在 release/** 上触发，而 verify 覆盖所有分支（双向）', () => {
