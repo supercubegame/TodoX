@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
-import { Report, GATES, RELEASE_GATES, SHOTS_GATES } from './lib/report.mjs';
+import { Report, GATES, RELEASE_GATES, SHOTS_GATES, MIRROR_GATES } from './lib/report.mjs';
 import { SHOTS, SHOT_DIR, MIN_BYTES } from './lib/shots.mjs';
 
 const require = createRequire(import.meta.url);
@@ -123,17 +123,19 @@ function sample() {
 }
 
 // ---------------------------------------------------------------- workflow 扫描器
-// 每个函数都吃 text 参数：三条流水线共用同一套扫描器。以前只扫 verify.yml，
+// 每个函数都吃 text 参数：四条流水线共用同一套扫描器。以前只扫 verify.yml，
 // 那样 release.yml 可以自由地长出一个没有 pipefail 的 tee 而没人看得见 ——
 // 模板级的修复不会自己跨文件传染。
 //
 // 这张表是手写的，那就是漏继承的下一个藏身处：再加一份 workflow 而忘了登记，
 // 它就完全在扫描范围之外，可以自由长出假绿。所以下面有一条断言让**目录本身
-// 成为期望**：实际存在的文件集合必须等于这张表。
+// 成为期望**：实际存在的文件集合必须等于这张表。实测有效 —— 加 mirror.yml 那次
+// 就是它当场抓住的。
 const WF = {
   verify: { path: '.github/workflows/verify.yml', text: null },
   release: { path: '.github/workflows/release.yml', text: null },
-  screenshots: { path: '.github/workflows/screenshots.yml', text: null }
+  screenshots: { path: '.github/workflows/screenshots.yml', text: null },
+  mirror: { path: '.github/workflows/mirror.yml', text: null }
 };
 function wf(key) {
   if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
@@ -574,6 +576,7 @@ const CHECKS = [
   // 这条是漏继承的解药。以前登记表是手写的两项，于是**新加的 workflow 文件完全
   // 在扫描范围之外**：它可以自由长出一个没有 pipefail 的 tee，而所有 run 依然
   // 全绿。手写清单永远追不上目录，所以让目录本身成为期望。
+  // 实测有效：加 mirror.yml 那次就是它当场抓住的。
   ['CI：.github/workflows 下每一份 workflow 都被扫描器登记（目录即期望）', () => {
     const dir = path.join(ROOT, '.github', 'workflows');
     const actual = fs.readdirSync(dir).filter(n => /\.ya?ml$/.test(n)).sort();
@@ -705,6 +708,30 @@ const CHECKS = [
     const wantSlugs = new Set(SHOTS_GATES.map(g => g.slug));
     expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
     return `${names.size} 个产物 + ${slugs.size} 条日志，与 SHOTS_GATES 完全相等`;
+  }],
+
+  // 镜像这条流水线的全部意义是「别把不该给的东西给出去」，所以它自己失效时
+  // 必须响亮。三件事在这里守：令牌缺失不许静默跳过、强推保证公开仓历史干净、
+  // 提交信息里带源 SHA（审计唯一能区分「同步成功」与「早就不同步了」的凭据）。
+  ['CI：mirror 的触发范围、令牌守卫与源 SHA 痕迹', () => {
+    const text = wf('mirror');
+    const on = onBlock(text);
+    expectTrue(on.length > 0, 'mirror.yml 里解析不到 on: 块 —— 扫描器坏了', text.slice(0, 300));
+    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
+    expectEq(branches, ['branches: [main]'], 'mirror.yml 的分支过滤');
+    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'mirror.yml 没有手动触发的口子', on.join('\n'));
+    const jobs = jobBlocks(text);
+    expectTrue(jobs.has('sync'), 'mirror.yml 里没有 sync job', [...jobs.keys()].join(','));
+    expectEq(jobs.get('sync').lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim()), [], 'sync job 上的 job 级 if');
+    // 令牌缺失必须 exit 1。静默跳过和「同步成功」在面板上长得一模一样。
+    expectTrue(text.includes('MIRROR_TOKEN:-') && text.includes('exit 1'), 'mirror.yml 没有在令牌缺失时明确失败', '静默跳过就等于「以为同步了，其实什么都没发生」');
+    expectTrue(text.includes('git push --force'), 'mirror.yml 不是强推 —— 公开仓可能留下私有历史', text.slice(0, 400));
+    expectTrue(text.includes('${GITHUB_SHA:0:7}'), '同步的提交信息里没有源 SHA', '那是审计唯一能区分「同步成功」与「镜像早就停在旧内容上」的凭据');
+    const names = tokenSet(text, RE_REPORT);
+    expectEq([...names].sort(), MIRROR_GATES.map(g => `report-${g.slug}`).sort(), '产物名集合');
+    const slugs = tokenSet(text, RE_STDOUT);
+    expectEq([...slugs].sort(), MIRROR_GATES.map(g => g.slug).sort(), 'stdout 日志 slug 集合');
+    return '只认 main，令牌缺失即红，强推 + 源 SHA 痕迹都在，产物名与 MIRROR_GATES 相等';
   }],
 
   ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
