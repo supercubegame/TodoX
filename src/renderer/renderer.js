@@ -10,6 +10,7 @@
     todos: [],
     counts: { total: 0, active: 0, completed: 0 },
     settings: null,
+    history: { canUndo: false, canRedo: false, undoDepth: 0, redoDepth: 0, limit: 0 },
     editingId: null,
     pendingDeleteId: null,
     renderCount: 0,
@@ -26,10 +27,11 @@
       get rendered() { return ui.todos.length; },
       get renderCount() { return ui.renderCount; },
       get settings() { return ui.settings === null ? null : Object.assign({}, ui.settings); },
+      get history() { return Object.assign({}, ui.history); },
       get view() { return Object.assign({}, ui.view); },
       get editingId() { return ui.editingId; },
       get lastError() { return ui.lastError === null ? null : Object.assign({}, ui.lastError); },
-      get schema() { return 1; }
+      get schema() { return 2; }
     }),
     writable: false,
     configurable: false,
@@ -56,6 +58,7 @@
     ui.todos = data.todos;
     ui.counts = data.counts;
     ui.settings = data.settings;
+    ui.history = data.history;
     applySettings(data.settings);
     render();
     ui.renderCount += 1;
@@ -85,7 +88,11 @@
     $('count-active').textContent = String(ui.counts.active);
     $('count-total').textContent = String(ui.counts.total);
 
-    for (const btn of document.querySelectorAll('.filters button')) {
+    // 按钮的禁用状态直接由摘要驱动，不自己算 —— 自己算就等于把规则抄第二份。
+    $('undo').disabled = !ui.history.canUndo;
+    $('redo').disabled = !ui.history.canRedo;
+
+    for (const btn of document.querySelectorAll('.filters button[data-filter]')) {
       btn.classList.toggle('on', btn.dataset.filter === ui.view.filter);
     }
     if (ui.editingId !== null) {
@@ -171,6 +178,16 @@
     call(() => api.remove(id, ui.view));
   }
 
+  // ---------------------------------------------------------------- 撤销
+  // 输入框里不接管 Ctrl+Z：那时它该是文本框自己的撤销。抢走它会让打字
+  // 变成一件危险的事（改了半行标题，一个 Ctrl+Z 把上一次删除恢复了）。
+  // 这条有负向断言守着。
+  function isTyping(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable === true;
+  }
+
   // ---------------------------------------------------------------- 事件
   function bind() {
     $('add').addEventListener('click', async () => {
@@ -188,7 +205,7 @@
       refresh();
     });
 
-    for (const btn of document.querySelectorAll('.filters button')) {
+    for (const btn of document.querySelectorAll('.filters button[data-filter]')) {
       btn.addEventListener('click', () => {
         ui.view.filter = btn.dataset.filter;
         refresh();
@@ -196,6 +213,20 @@
     }
 
     $('clear-completed').addEventListener('click', () => call(() => api.clearCompleted(ui.view)));
+    $('undo').addEventListener('click', () => call(() => api.undo(ui.view)));
+    $('redo').addEventListener('click', () => call(() => api.redo(ui.view)));
+
+    document.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key !== 'z' && e.key !== 'Z') return;
+      if (isTyping(document.activeElement)) return;
+      e.preventDefault();
+      if (e.shiftKey) {
+        if (ui.history.canRedo) call(() => api.redo(ui.view));
+      } else if (ui.history.canUndo) {
+        call(() => api.undo(ui.view));
+      }
+    });
 
     $('settings-toggle').addEventListener('click', () => {
       const panel = $('settings-panel');
