@@ -68,13 +68,35 @@ jobs:
             test/artifacts/
             docs/screenshots/
           if-no-files-found: error
-      # 只有截图闸门绿了才回写。红的时候提交上去，等于把黑图钉进仓库。
+      # ======================================================================
+      # 回写守卫。这一步推的是**同一条分支**，而这个 workflow 就挂在这条分支的
+      # push 上，所以必须有一个终止条件。
       #
-      # 提交信息里的 [skip ci] 是承重的：这一步推回的是**同一条分支**，而这个
-      # workflow 就挂在这条分支的 push 上 —— 没有它就是一个无限循环。
-      # 快闸门有一条断言在守这个标记。
+      # 原来的终止条件是提交信息里的 `[skip ci]` —— **一个字符串**。谁手动改一次
+      # 提交信息模板，这条流水线就开始自触发，而且没有任何东西会喊。现在换成
+      # 身份判断，两层：
+      #
+      #   1. 触发本次运行的那个提交，committer 邮箱不许是下面 git config 配的
+      #      那个。这一层是**承重的**：它与推送用的令牌无关，换成 PAT 也成立。
+      #      两处邮箱必须逐字相同，快闸门会去比 —— 改一处不改另一处，守卫就哑了。
+      #   2. github.actor 不是 github-actions[bot]。这层只在用 GITHUB_TOKEN 时
+      #      有效（PAT 推送时 actor 是 PAT 的主人），所以它是第二层，不是第一层。
+      #
+      # 诚实一句：GITHUB_TOKEN 推的提交本来就不会触发 workflow，所以这个循环在
+      # 当前配置下大概从没真的发生过。但「靠一个没写在配置里的平台行为」和
+      # 「靠一个提交信息里的字符串」是同一类脆。现在它是一条显式的、读得懂的条件。
+      #
+      # `[skip ci]` **已经删掉，别加回来**：留着它会让上面这两层永远走不到，
+      # 那就没法区分「它在守」和「它是空的」。快闸门有一条断言禁止它回来。
+      #
+      # 顺带：被跳过的那次运行不是浪费。它拿刚提交进去的 PNG 又跑了一遍截图
+      # 闸门 —— 相当于对回写结果的一次免费复核。
+      # ======================================================================
       - name: 回写截图
-        if: steps.gate.outcome == 'success'
+        if: |
+          steps.gate.outcome == 'success'
+          && github.event.head_commit.committer.email != '41898282+github-actions[bot]@users.noreply.github.com'
+          && github.actor != 'github-actions[bot]'
         shell: bash
         run: |
           set -euo pipefail
@@ -85,9 +107,22 @@ jobs:
             echo '截图与仓库里的完全一致，没有需要提交的改动'
             exit 0
           fi
-          git commit -m 'chore(shots): 由 CI 重新生成截图 [skip ci]'
+          git commit -m 'chore(shots): 由 CI 重新生成截图'
           git push origin HEAD:${{ github.ref_name }}
           git log -1 --stat
+      # 守卫生效时留个痕迹。否则「被身份守卫拦住了」和「闸门红了所以没回写」
+      # 在面板上长得一样 —— 而那是两件完全不同的事。
+      - name: 说明为什么没有回写
+        if: |
+          steps.gate.outcome == 'success'
+          && (github.event.head_commit.committer.email == '41898282+github-actions[bot]@users.noreply.github.com'
+          || github.actor == 'github-actions[bot]')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '本次由回写自己触发（committer 是 bot），身份守卫拦住了第二次回写。'
+          echo '这不是失败：它顺便拿刚提交的 PNG 又跑了一遍截图闸门。'
+          echo "actor=${{ github.actor }}"
       - name: 闸门失败则失败
         if: steps.gate.outcome == 'failure'
         run: exit 1
