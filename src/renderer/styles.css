@@ -1,0 +1,106 @@
+/* 主题令牌。改这两个背景色必须同步改端到端闸门里的 LIGHT_BG / DARK_BG，
+   否则闸门红的是尺子不是产品。见 AGENTS.md「相互耦合的参数」。 */
+body[data-theme="light"] {
+  --bg: #f6f7f9;
+  --fg: #1a1d22;
+  --card: #ffffff;
+  --line: #dfe3e8;
+  --muted: #6b7480;
+  --accent: #3b6cf6;
+}
+body[data-theme="dark"] {
+  --bg: #161a20;
+  --fg: #e8ecf1;
+  --card: #1e242c;
+  --line: #2c343e;
+  --muted: #93a0af;
+  --accent: #6d93ff;
+}
+
+/* [hidden] 必须压过下面任何 display 规则，否则「确认框不可见」这条断言会
+   在确认框其实还挂在屏幕上的时候通过。 */
+[hidden] { display: none !important; }
+
+* { box-sizing: border-box; }
+
+html { font-size: 16px; }
+
+body {
+  margin: 0;
+  padding: 0 20px 20px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 1rem;
+}
+
+.bar { display: flex; align-items: center; gap: 10px; padding: 14px 0; }
+.brand { font-size: 1.25rem; margin: 0 auto 0 0; letter-spacing: 0.5px; }
+.foot { border-top: 1px solid var(--line); margin-top: 14px; color: var(--muted); justify-content: space-between; }
+
+input, select, button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+button { cursor: pointer; }
+button.on { background: var(--accent); color: #fff; border-color: transparent; }
+button.danger { background: #e5484d; color: #fff; border-color: transparent; }
+input[type="checkbox"], input[type="range"] { padding: 0; border: 0; background: none; }
+
+.composer { display: flex; gap: 10px; }
+.composer input[data-testid="new-title"] { flex: 1; }
+
+.error { color: #e5484d; margin: 10px 0 0; font-size: 0.9rem; }
+
+.filters { display: flex; gap: 8px; margin: 14px 0 10px; }
+
+.list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+/* 探针条：这个颜色在整个应用里只允许出现在这里。端到端闸门数的就是它，
+   而「空列表时必须为 0 像素」这条负向孪生一旦被别处复用就变成空断言。 */
+.probe { flex: none; width: 8px; height: 22px; border-radius: 2px; background: #00d684; }
+
+.item .title { flex: 1; font-size: 1rem; }
+.item[data-done="true"] .title { text-decoration: line-through; color: var(--muted); }
+.item input[data-testid="item-edit-input"] { flex: 1; font-size: 1rem; }
+.item .badge { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+
+.empty { color: var(--muted); text-align: center; padding: 28px 0; }
+
+.settings {
+  margin-top: 16px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.settings h2 { margin: 0; font-size: 1rem; }
+.settings label { display: flex; align-items: center; gap: 10px; }
+
+.confirm {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.confirm .box { background: var(--card); border-radius: 12px; padding: 20px 22px; min-width: 280px; }
+.confirm .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }

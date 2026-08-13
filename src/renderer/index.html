@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:" />
+<link rel="icon" href="data:," />
+<title>TodoX</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body data-theme="light">
+
+<header class="bar">
+  <h1 class="brand">TodoX</h1>
+  <input data-testid="search" type="search" placeholder="搜索标题或备注" autocomplete="off" />
+  <button data-testid="settings-toggle" type="button">设置</button>
+</header>
+
+<section class="composer">
+  <input data-testid="new-title" type="text" placeholder="要做点什么？" autocomplete="off" />
+  <select data-testid="new-priority">
+    <option value="high">高</option>
+    <option value="normal" selected>中</option>
+    <option value="low">低</option>
+  </select>
+  <button data-testid="add" type="button">添加</button>
+</section>
+
+<p data-testid="error" class="error" hidden></p>
+
+<nav class="filters">
+  <button data-testid="filter-all" data-filter="all" type="button" class="on">全部</button>
+  <button data-testid="filter-active" data-filter="active" type="button">未完成</button>
+  <button data-testid="filter-completed" data-filter="completed" type="button">已完成</button>
+</nav>
+
+<ul data-testid="list" class="list"></ul>
+<p data-testid="empty" class="empty" hidden>还没有待办。上面加一条试试。</p>
+
+<footer class="bar foot">
+  <span>未完成 <b data-testid="count-active">0</b> / 共 <b data-testid="count-total">0</b></span>
+  <button data-testid="clear-completed" type="button">清除已完成</button>
+</footer>
+
+<aside data-testid="settings-panel" class="settings" hidden>
+  <h2>设置</h2>
+  <label>主题
+    <select data-testid="set-theme">
+      <option value="light">浅色</option>
+      <option value="dark">深色</option>
+    </select>
+  </label>
+  <label>字号
+    <input data-testid="set-fontscale" type="range" min="80" max="160" step="10" />
+    <b data-testid="set-fontscale-value">100</b>%
+  </label>
+  <label class="row"><input data-testid="set-confirmdelete" type="checkbox" /> 删除前确认</label>
+  <label>默认优先级
+    <select data-testid="set-priority">
+      <option value="high">高</option>
+      <option value="normal">中</option>
+      <option value="low">低</option>
+    </select>
+  </label>
+  <label>默认排序
+    <select data-testid="set-sort">
+      <option value="created">创建时间</option>
+      <option value="title">标题</option>
+      <option value="priority">优先级</option>
+    </select>
+  </label>
+</aside>
+
+<div data-testid="confirm" class="confirm" hidden>
+  <div class="box">
+    <p data-testid="confirm-text">确定删除？</p>
+    <div class="actions">
+      <button data-testid="confirm-no" type="button">取消</button>
+      <button data-testid="confirm-yes" type="button" class="danger">删除</button>
+    </div>
+  </div>
+</div>
+
+<script src="renderer.js" defer></script>
+</body>
+</html>
