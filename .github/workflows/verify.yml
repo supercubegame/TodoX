@@ -1,0 +1,152 @@
+name: verify
+
+# 只挂 push。挂 pull_request 会让每次推送跑两遍，而回写那个 job 本来就会
+# 从 commit 反查 PR。这里**没有任何 job 级 if**：条件写歪会让 job 静默永不
+# 执行，而所有 run 依然全绿。快闸门有一条断言在守这件事。
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: 快闸门
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # continue-on-error 是为了让报告还能上传；job 在最后一步才真的失败。
+      # tee 一定要配 pipefail：bash 默认管道退出码取最后一个命令，
+      # 也就是 tee 的 0 —— 闸门红了 job 照样绿。
+      - name: 跑快闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify.mjs 2>&1 | tee test/artifacts/stdout-fast.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-fast
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  e2e:
+    name: Electron 端到端闸门
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 缓存 Electron 下载
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - name: 装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1
+      - name: 装依赖
+        run: npm install --no-audit --no-fund
+      # xvfb 默认是 8 位色深，那会让「数探针颜色像素」这条断言变成掷骰子。
+      # 显式要 24 位。
+      - name: 跑端到端闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          xvfb-run -a --server-args="-screen 0 1600x1200x24" node scripts/verify-e2e.mjs 2>&1 | tee test/artifacts/stdout-e2e.log
+      - name: 上传报告与截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-e2e
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  pack:
+    name: 打包闸门
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            slug: pack-linux
+          - os: macos-14
+            slug: pack-mac
+          - os: windows-2022
+            slug: pack-win
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 装依赖
+        run: npm install --no-audit --no-fund
+      - name: 跑打包闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        env:
+          TODOX_PACK_SLUG: ${{matrix.slug}}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify-pack.mjs 2>&1 | tee test/artifacts/stdout-${{matrix.slug}}.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{matrix.slug}}
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  # ==========================================================================
+  # 回写不在这里。它是 supercubegame/ci-workflows 里的一份文件，image-grabber
+  # 和 jumpwow 用的是同一份。
+  #
+  # 那个 job 里每一条不寻常的设计（不 checkout、兜底评论前置、取脚本和回写都
+  # 带重试、降级报告自己说明自己是降级的）都写在那份文件的头部注释里。
+  # 短版本：曾经有一次两条闸门全绿，而那次提交上一条评论都没有。
+  #
+  # 快闸门断言下面这行 uses、这个 job 永远不许自己长出 steps、以及 gates 里
+  # 带的是真实的 needs.*.result。
+  # ==========================================================================
+  summary:
+    name: 回报结果
+    if: always()
+    needs: [fast, e2e, pack]
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    with:
+      node-version: '20'
+      gates: '[{"name":"快闸门","result":"${{ needs.fast.result }}"},{"name":"Electron 端到端闸门","result":"${{ needs.e2e.result }}"},{"name":"三平台打包闸门","result":"${{ needs.pack.result }}"}]'
+      composer-files: scripts/compose-report.mjs scripts/lib/report.mjs
+      composer-entry: scripts/compose-report.mjs
+      marker: '<!-- todox-verify -->'
