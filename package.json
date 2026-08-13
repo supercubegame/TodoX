@@ -1,0 +1,31 @@
+{
+  "name": "todox",
+  "productName": "TodoX",
+  "version": "0.1.0",
+  "description": "TodoX - 跨平台待办事项应用（Electron）",
+  "author": "supercubegame",
+  "license": "MIT",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "verify": "node scripts/verify.mjs",
+    "verify:e2e": "node scripts/verify-e2e.mjs",
+    "verify:pack": "node scripts/verify-pack.mjs",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder -mwl"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3",
+    "playwright-core": "^1.47.2"
+  },
+  "build": {
+    "appId": "com.supercubegame.todox",
+    "productName": "TodoX",
+    "directories": { "output": "dist" },
+    "files": ["src/**/*", "package.json"],
+    "win": { "target": ["nsis", "zip"] },
+    "mac": { "target": ["dmg", "zip"], "category": "public.app-category.productivity" },
+    "linux": { "target": ["AppImage", "deb"], "category": "Utility" }
+  }
+}
