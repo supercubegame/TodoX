@@ -37,7 +37,7 @@ jobs:
       # xvfb 默认 8 位色深，那会让「背景色等于主题令牌」和「探针像素个数」
       # 两条断言一起变成掷骰子。显式要 24 位。
       #
-      # continue-on-error 是为了让日志还能上传；job 在最后一步才真的失败。
+      # continue-on-error 是为了让报告还能上传；job 在最后一步才真的失败。
       # tee 一定要配 pipefail，否则管道退出码取 tee 的 0 —— 闸门红了 job 照样绿。
       - name: 生成截图
         id: gate
@@ -45,13 +45,15 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          mkdir -p test/artifacts
+          mkdir -p test/artifacts docs/screenshots
           xvfb-run -a --server-args="-screen 0 1600x1200x24" node scripts/shoot.mjs 2>&1 | tee test/artifacts/stdout-shots.log
-      - name: 上传日志与截图
+      # 报告和截图一起传。产物名必须是 report-shots：composer 按 SHOTS_GATES
+      # 去找 report-<slug>.json，快闸门断言这两边相等。
+      - name: 上传报告与截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shots-artifacts
+          name: report-shots
           path: |
             test/artifacts/
             docs/screenshots/
@@ -79,3 +81,21 @@ jobs:
       - name: 闸门失败则失败
         if: steps.gate.outcome == 'failure'
         run: exit 1
+
+  # 这个 job 是补上来的。截图流水线一开始没有回写，于是第一次失败时报告只存在
+  # 于 CI 日志里 —— 而那是 agent 读不到的地方。从外面看，「跑了但没产出截图」
+  # 和「压根没跑」长得一模一样。送不出结论的闸门等于没跑。
+  summary:
+    name: 回报截图结果
+    if: always()
+    needs: [shots]
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    with:
+      node-version: '20'
+      gates: '[{"name":"截图生成器","result":"${{ needs.shots.result }}"}]'
+      composer-files: scripts/compose-shots-report.mjs scripts/lib/compose.mjs scripts/lib/report.mjs
+      composer-entry: scripts/compose-shots-report.mjs
+      marker: '<!-- todox-shots -->'

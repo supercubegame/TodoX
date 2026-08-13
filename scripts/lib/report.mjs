@@ -27,6 +27,15 @@ export const RELEASE_GATES = [
   { slug: 'release-assets', label: '发布资产校验闸门' }
 ];
 
+// 截图流水线（screenshots.yml）的闸门清单。
+//
+// 它一开始没有回写 job，于是第一次失败时报告只存在于 CI 日志里 —— 而那正是
+// agent 读不到的地方。从仓库外面看，「跑了但没产出截图」和「压根没跑」长得
+// 一模一样。三条流水线现在都接同一份共享回写。
+export const SHOTS_GATES = [
+  { slug: 'shots', label: '截图生成器' }
+];
+
 export class Report {
   constructor(name) {
     this.name = name;
