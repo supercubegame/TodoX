@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 公开镜像的审计闸门。
+// 公开镜像的审计闸门（外加一条 main 侧的版本回流断言）。
 //
 // **它不看本地暂存目录。** 暂存目录是我自己算出来的，验它等于验一段拷贝逻辑。
 // 这里回头去读公开仓**真实的树**,因为这件事最像成功的失败是「推上去了，
@@ -29,6 +29,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const SRC_SHA = process.env.GITHUB_SHA || '';
+const SRC_REPO = process.env.GITHUB_REPOSITORY || 'supercubegame/TodoX';
 const report = new Report('公开镜像同步');
 
 const state = { tree: null, commits: null };
@@ -52,6 +53,16 @@ function gh(args, label) {
   if (r.error) fail(`${label}：gh 起不来`, String(r.error.message));
   if (r.status !== 0) fail(`${label}：gh 退出码 ${r.status}`, tailOf(`${r.stdout || ''}\n${r.stderr || ''}`));
   return r.stdout || '';
+}
+
+// 语义版本比较。只比 x.y.z 三段，够用了。
+function cmpSemver(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i += 1) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0) ? -1 : 1;
+  }
+  return 0;
 }
 
 const CHECKS = [
@@ -133,6 +144,28 @@ const CHECKS = [
       sizes.push(`${path.basename(p)} ${(size / 1024).toFixed(0)}KB`);
     }
     return sizes.join('，');
+  }],
+
+  // 这条跟镜像没关系，但它必须住在一个「每次推 main 都跑、而且能上网」的地方,
+  // 快闸门是零依赖离线的，看不到「已经发过什么版本」。
+  //
+  // 同一个毛病犯了两次：v1.0.0 的 deb 修复只活在 release 分支上没回 main；
+  // v1.0.1 的版本号也只在 release 分支上 bump。形状一样,发布分支上的改动
+  // 没有回流，而 main 看起来完全正常。犯两次的规矩就该变成断言。
+  ['main 的版本号不低于最新已发布的 tag（发布分支必须回流）', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const raw = gh(['api', `repos/${SRC_REPO}/releases?per_page=100`, '--jq', '[.[] | select(.draft == false) | .tag_name]'], '读取已发布的 tag');
+    const tags = JSON.parse(raw);
+    if (tags.length === 0) return `还没有任何正式发布，main 上是 ${pkg.version}`;
+    const latest = tags.slice().sort(cmpSemver).pop();
+    expectTrue(
+      cmpSemver(pkg.version, latest) >= 0,
+      `main 的版本号（${pkg.version}）低于已发布的 ${latest}`,
+      `已发布的 tag: ${tags.join(', ')}\n` +
+      '说明发布分支上的改动没有回流到 main。下一次从 main 切发布分支会重复上一版的号，\n' +
+      '或者重踩上一版已经修过的坑 —— 而 main 本身看起来完全正常。'
+    );
+    return `main ${pkg.version} >= 最新发布 ${latest}（共 ${tags.length} 个正式发布）`;
   }],
 
   ['自检：本次实际执行的检查数等于清单数', () => {
