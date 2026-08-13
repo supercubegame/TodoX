@@ -14,6 +14,7 @@ Electron 三平台待办事项应用。改完任何东西，**必须跑闸门**�
    闸门会当场变哑。
 4. 密钥只走仓库 secrets。代码、日志、报告里一个字符都不能出现。
 5. 新增可验证行为，顺手补一条断言，并更新 `scripts/manifest.json` 里的条数。
+6. **发布分支上的改动必须回流 main。** 已经犯过两次，现在有断言在守（见下）。
 
 ## 结构
 
@@ -30,7 +31,7 @@ scripts/verify-pack.mjs 打包闸门：三平台各打一次 --dir（每平台 4
 scripts/verify-dist.mjs 安装包闸门：三平台各打真安装包（每平台 6 条）
 scripts/verify-release.mjs 发布资产校验：把 Release 从 API 读回来（6 条）
 scripts/shoot.mjs       截图生成器：真起 Electron 截 README 用的图（8 条）
-scripts/verify-mirror.mjs 镜像审计：把公开仓的树从 API 读回来（9 条）
+scripts/verify-mirror.mjs 镜像审计 + 版本回流：读公开仓真实的树（10 条）
 scripts/lib/compose.mjs 报告合成，四条流水线共用
 scripts/lib/mirror.mjs  公开镜像的路径白名单与黑名单，唯一一份
 ```
@@ -78,6 +79,9 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
   `release.yml` 的「发布前清点资产」。加减一个架构必须三处同改。
 - **安装包体积地板 30MB** 同时写在 `verify-dist.mjs` 和 `verify-release.mjs`。
   实测最小的产物在 70MB 上下，留了三倍余量；它只用来抓「打出来是个空壳」。
+- **`package.json` 的 `version`** ↔ 已发布的 `vX.Y.Z` tag。发布分支 bump 完必须
+  回流 main，镜像审计里有一条在守（放那儿是因为它每次推 main 都跑且能上网,
+  快闸门是离线的，看不到「已经发过什么」）。
 - **`lib/mirror.mjs` 的 `ALLOW_TOP` / `DENY_PATHS` / `REQUIRE_FILES`** ↔ `mirror.yml`
   里那段拷贝脚本。新增顶层目录默认**不**同步（白名单），但要记得决定它该不该给。
 - **`screenshots.yml` 里装 `fonts-noto-cjk` 那一行**是承重的。删了界面上每个汉字
@@ -109,6 +113,10 @@ npm run verify:dist 安装包闸门（需要 TODOX_DIST_SLUG=dist-linux|dist-mac
 **推送失败时读到的是上一次留下的内容，于是每一条断言都通过。** 所以两边都要有
 一条断言把结果钉在**本次**运行上（镜像那条是「提交信息里含本次 `GITHUB_SHA`」）。
 「没有坏消息」和「早就不同步了」长得一模一样，带时间戳的痕迹不会。
+
+同一类形状还有「发布分支不回流」：改动只活在 `release/**` 上，而 main 看起来
+完全正常。这个毛病犯过两次（v1.0.0 的 deb 修复、v1.0.1 的版本号），所以它
+现在是一条断言而不是一句嘱咐。
 
 ## 测不出来的
 
