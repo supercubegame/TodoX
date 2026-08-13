@@ -9,5 +9,7 @@ contextBridge.exposeInMainWorld('todox', Object.freeze({
   toggle: (id, opts) => ipcRenderer.invoke('todos:toggle', id, opts),
   remove: (id, opts) => ipcRenderer.invoke('todos:remove', id, opts),
   clearCompleted: (opts) => ipcRenderer.invoke('todos:clearCompleted', opts),
-  setSettings: (patch, opts) => ipcRenderer.invoke('settings:set', patch, opts)
+  setSettings: (patch, opts) => ipcRenderer.invoke('settings:set', patch, opts),
+  undo: (opts) => ipcRenderer.invoke('history:undo', opts),
+  redo: (opts) => ipcRenderer.invoke('history:redo', opts)
 }));
