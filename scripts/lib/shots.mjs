@@ -5,10 +5,14 @@
 // 只会得到一个 README 里的破图 —— 而破图不会让任何东西变红。
 export const SHOT_DIR = 'docs/screenshots';
 
+// rows 是这张图上**应该**出现几条待办。它不是装饰：截图那一刻 capturePage
+// 给的可能是上一帧，于是 DOM 说 1 行、位图里却是 3 行。生成器靠
+// rows × PROBE_PER_ROW 一直轮询到两边对上，这条顺带变成了内容断言 ——
+// 「这张图上画的是不是我想要的那个状态」。
 export const SHOTS = [
-  { slug: 'light-list', theme: 'light', caption: '浅色主题 · 列表、优先级与筛选页签' },
-  { slug: 'search', theme: 'light', caption: '搜索：关键词同时匹配标题与备注' },
-  { slug: 'dark-settings', theme: 'dark', caption: '深色主题 · 设置面板（主题 / 字号 / 删除确认 / 默认值）' }
+  { slug: 'light-list', theme: 'light', rows: 3, caption: '浅色主题 · 列表、优先级与筛选页签' },
+  { slug: 'search', theme: 'light', rows: 1, caption: '搜索：关键词同时匹配标题与备注' },
+  { slug: 'dark-settings', theme: 'dark', rows: 3, caption: '深色主题 · 设置面板（主题 / 字号 / 删除确认 / 默认值）' }
 ];
 
 export function shotPath(slug) { return `${SHOT_DIR}/${slug}.png`; }
@@ -23,3 +27,18 @@ export const THEME_BG = {
 // 待办行标记条的颜色。整个应用里只有那里用它，所以「这张图上有几个探针像素」
 // 等价于「列表真的画出来了几行」。
 export const PROBE = { r: 0, g: 214, b: 132 };
+
+// 一行贡献多少个探针像素。实测值：.probe 是 8x22，抗锯齿之后稳定落在 164,
+// 端到端闸门里 3 行也一直是 492 = 3 x 164。
+//
+// 改 styles.css 里 .probe 的宽高必须重算这个数（见 AGENTS.md「相互耦合的参数」）。
+// 容差取 ±24：1 行(164) 与 3 行(492) 的区间离得很远，不会互相吃掉,
+// 也就是说这条断言不可能因为容差太宽而变空。
+export const PROBE_PER_ROW = 164;
+export const PROBE_TOL = 24;
+
+// 只用来抓「空图 / 截图接口什么都没返回」。**不是**画面质量的度量 ——
+// 大片纯色的界面 PNG 实测压到 15KB 左右，第一版拍脑袋写 20KB 直接把三张
+// 真图判成假的。取 5KB，对实测最小值留三倍余量。
+// 真正承重的是探针像素数与背景色令牌那两条。
+export const MIN_BYTES = 5000;
