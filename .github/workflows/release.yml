@@ -1,0 +1,176 @@
+name: release
+
+# 只在 release/** 分支上触发。**不**挂 main 的每次推送：那样每个提交都会尝试
+# 建一个同名 tag，第二次开始全红，然后人会学会忽略这条流水线。
+# 触发策略本身有断言在守（快闸门里那条「release 只在 release/** 上触发」，
+# 双向：漏了要红，多挂了 main 或 ** 也要红）。
+on:
+  push:
+    branches: ['release/**']
+  workflow_dispatch:
+
+# 发布不许被后一次推送掐掉：掐一半会留下一个只有部分资产的 Release，
+# 而那玩意在面板上是绿的。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dist:
+    name: 安装包闸门
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            slug: dist-linux
+          - os: macos-14
+            slug: dist-mac
+          - os: windows-2022
+            slug: dist-win
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 装依赖
+        run: npm install --no-audit --no-fund
+      # tee 必须配 pipefail，否则退出码是 tee 的 0：闸门红了 job 照样绿。
+      - name: 跑安装包闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        env:
+          TODOX_DIST_SLUG: ${{matrix.slug}}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify-dist.mjs 2>&1 | tee test/artifacts/stdout-${{matrix.slug}}.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{matrix.slug}}
+          path: test/artifacts/
+          if-no-files-found: error
+      # installers/ 的内容由闸门决定，不是 dist/* 通配符。见 verify-dist.mjs 头部。
+      - name: 上传安装包
+        if: steps.gate.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{matrix.slug}}
+          path: installers/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  publish:
+    name: 发布 Release
+    needs: [dist]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 取版本号
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tag=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: 下载三平台安装包
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
+          pattern: installers-*
+          merge-multiple: true
+      # 在建 Release **之前**先数一遍。资产不齐就别发出去 —— 一个缺了 mac 的
+      # Release 从外面看和完整的一模一样。8 = linux 2 + mac 4 + win 2，
+      # 和 verify-dist.mjs 的 PLAN 是一组，改一个必须重算另一个。
+      - name: 发布前清点资产
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la installers
+          n=$(find installers -type f | wc -l | tr -d ' ')
+          echo "将要发布 $n 个文件"
+          test "$n" -eq 8
+      - name: 建 Release 并上传资产
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: TodoX ${{ steps.v.outputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: installers/*
+          body: |
+            TodoX ${{ steps.v.outputs.tag }} — Electron 三平台待办事项应用。
+
+            | 平台 | 下载 |
+            | --- | --- |
+            | Windows | `TodoX Setup *.exe`（安装版）或 `*-win.zip`（免安装） |
+            | macOS | `*-arm64.dmg`（Apple 芯片）或 `*-x64.dmg`（Intel） |
+            | Linux | `*.AppImage`（免安装，`chmod +x` 后直接跑）或 `*.deb` |
+
+            **安装包没有签名。** macOS 会拦，右键「打开」再确认一次；
+            Windows SmartScreen 会拦，点「更多信息」→「仍要运行」。
+
+            这一版由 CI 验证：快闸门 45 项、Electron 端到端 18 项、
+            三平台打包各 4 项、安装包闸门各 6 项、发布资产校验 6 项。
+
+  # 发布那步退出码为 0 证明不了用户下载得到东西。这个 job 把 Release 从 API
+  # 读回来数资产 —— 正向痕迹。它挂 if: always()，所以上游炸了它也会跑，
+  # 然后如实报「读不到 Release」，而不是静默跳过。
+  verify:
+    name: 发布资产校验闸门
+    needs: [dist, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 跑发布资产校验闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify-release.mjs 2>&1 | tee test/artifacts/stdout-release-assets.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-release-assets
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: 闸门失败则失败
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  # 回写走的是和 verify.yml 同一份共享 workflow，只是换了 composer 入口和 marker。
+  summary:
+    name: 回报结果
+    if: always()
+    needs: [dist, publish, verify]
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    with:
+      node-version: '20'
+      gates: '[{"name":"安装包闸门","result":"${{ needs.dist.result }}"},{"name":"发布 Release","result":"${{ needs.publish.result }}"},{"name":"发布资产校验闸门","result":"${{ needs.verify.result }}"}]'
+      composer-files: scripts/compose-release-report.mjs scripts/lib/report.mjs scripts/lib/compose.mjs
+      composer-entry: scripts/compose-release-report.mjs
+      marker: '<!-- todox-release -->'

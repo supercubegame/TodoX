@@ -6,15 +6,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-// 闸门清单。composer 按它决定「该有哪几份报告」，快闸门按它反查 workflow 里
-// tee 出来的 stdout-<slug>.log 和上传的 report-<slug> 产物是否一一对应。
-// 两边引用同一个数组，所以「加了一条闸门但 composer 不知道」不可能悄悄发生。
+// 验证流水线（verify.yml）的闸门清单。composer 按它决定「该有哪几份报告」，
+// 快闸门按它反查 workflow 里 tee 出来的 stdout-<slug>.log 和上传的
+// report-<slug> 产物是否一一对应。两边引用同一个数组，所以「加了一条闸门但
+// composer 不知道」不可能悄悄发生。
 export const GATES = [
   { slug: 'fast', label: '快闸门（纯核心 + 静态断言）' },
   { slug: 'e2e', label: 'Electron 端到端闸门' },
   { slug: 'pack-linux', label: '打包闸门 · Linux' },
   { slug: 'pack-mac', label: '打包闸门 · macOS' },
   { slug: 'pack-win', label: '打包闸门 · Windows' }
+];
+
+// 发布流水线（release.yml）的闸门清单。同样被快闸门拿去和 release.yml 里的
+// matrix、产物名、stdout 日志名对齐。
+export const RELEASE_GATES = [
+  { slug: 'dist-linux', label: '安装包闸门 · Linux' },
+  { slug: 'dist-mac', label: '安装包闸门 · macOS' },
+  { slug: 'dist-win', label: '安装包闸门 · Windows' },
+  { slug: 'release-assets', label: '发布资产校验闸门' }
 ];
 
 export class Report {
