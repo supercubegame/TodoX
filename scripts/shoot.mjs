@@ -2,6 +2,7 @@
 // 截图生成器：真的起 Electron，喂一份固定的存档，截三张图写进 docs/screenshots。
 //
 // 截图是副作用，所以这里**验最终产物**，不验「截图接口被调用过」：
+//   - 中文字形真的画出来了（豆腐块检测，见下）
 //   - 探针像素个数 == 这张图该有的行数 x 每行 164（内容断言，也是重绘屏障）
 //   - 背景色等于该主题的令牌（深色那张必须真的是深色，负向孪生）
 //   - PNG 存在且字节数过得去（只抓空图，不当画面质量的度量）
@@ -11,6 +12,10 @@
 // **上一帧**，于是 search 那张 DOM 已经只剩 1 行、位图里却还是 3 行的 492 个
 // 探针像素，而「三张图互不相同」照样绿 —— 它们确实互不相同，只是每张都晚了
 // 一步。所以截图这个动作本身也必须轮询，不能取一次就走。
+//
+// 豆腐块那条是第二次真实失败换来的，而且更值得记：**7/7 全绿，三张图的中文
+// 全是方块。** runner 不带中日韩字体，可上面每一条断言都在验它该验的东西 ——
+// 没有一条在看「字有没有画出来」。覆盖缺口和空断言在报告上长得一模一样。
 //
 // capturePage 拿到的位图既用来写文件、又用来算指标 —— 一个来源。分成两次抓的话，
 // 指标可能量的是另一帧，而那种谎最难发现。
@@ -83,6 +88,45 @@ const diag = () => ctx.page.evaluate(() => JSON.parse(JSON.stringify({
   settings: window.__DIAG__.settings
 })));
 
+// 字形签名：用界面自己的字体族把一个字画到离屏 canvas 上，统计墨迹像素并算一个
+// 位置相关的哈希。缺字体时中文会全部退化成同一个豆腐块，签名彼此相等。
+async function glyphSignatures() {
+  return await ctx.page.evaluate(() => {
+    const size = 48;
+    const c = document.createElement('canvas');
+    c.width = size;
+    c.height = size;
+    const g = c.getContext('2d');
+    const family = getComputedStyle(document.body).fontFamily;
+    const draw = (ch) => {
+      g.clearRect(0, 0, size, size);
+      g.fillStyle = '#000000';
+      g.font = `32px ${family}`;
+      g.textBaseline = 'top';
+      g.fillText(ch, 4, 4);
+      const data = g.getImageData(0, 0, size, size).data;
+      let ink = 0;
+      let hash = 0;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i] > 32) {
+          ink += 1;
+          hash = (hash * 31 + i) % 2147483647;
+        }
+      }
+      return { ink, hash };
+    };
+    return {
+      family,
+      han1: draw('早'),
+      han2: draw('删'),
+      // U+E000 在 Unicode 私用区，没有任何字体会给它字形 —— 它**必然**是豆腐块。
+      // 拿它当基准，就不用去猜「豆腐块长什么样」。
+      tofu: draw('\uE000'),
+      ascii: draw('A')
+    };
+  });
+}
+
 // 一次 capturePage，同时产出 PNG 字节和像素指标。
 async function grab() {
   return await ctx.app.evaluate(async ({ BrowserWindow }, args) => {
@@ -118,7 +162,7 @@ async function capture(slug) {
     shot = await grab();
     seen.push(shot.probe);
     return Math.abs(shot.probe - wantProbe) <= PROBE_TOL;
-  }, 20000).catch(err => {
+  }, 20000).catch(() => {
     fail(`${slug}：位图一直没追上 DOM 状态`, `期望探针 ${wantProbe} ± ${PROBE_TOL}（${spec.rows} 行 x ${PROBE_PER_ROW}）\n` +
       `每次观测到: ${seen.join(', ')}\n` +
       'capturePage 会返回上一帧 —— DOM 断言过了不代表画面跟上了。');
@@ -193,6 +237,26 @@ const STEPS = [
     return `3 条待办（1 条已完成），窗口 ${WIDTH}x${HEIGHT}`;
   }],
 
+  // 这一步放在所有截图之前：字体缺了就该在截图之前红，别产出一堆方块图。
+  ['字形：中文真的画出来了，不是豆腐块（负向孪生）', async () => {
+    const g = await glyphSignatures();
+    const brief = `字体族=${g.family}\n` +
+      `早 ink=${g.han1.ink} hash=${g.han1.hash}\n` +
+      `删 ink=${g.han2.ink} hash=${g.han2.hash}\n` +
+      `U+E000（必然是豆腐块）ink=${g.tofu.ink} hash=${g.tofu.hash}\n` +
+      `A ink=${g.ascii.ink} hash=${g.ascii.hash}`;
+    expectTrue(g.han1.ink > 0 && g.han2.ink > 0, '汉字一个墨迹像素都没有，画字这件事根本没发生', brief);
+    expectTrue(g.tofu.ink > 0, '连 U+E000 都画不出东西 —— 是这条断言的夹具坏了，不是字体缺了', `${brief}\n基准本身必须是个看得见的方块，否则下面的比较全部免费通过。`);
+    // 核心那条：缺字体时汉字会退化成和 U+E000 一样的方块，签名相等。
+    expectTrue(g.han1.hash !== g.tofu.hash, '「早」渲染成了豆腐块 —— 运行环境缺中日韩字体', `${brief}\n装 fonts-noto-cjk 可修。这不是产品问题：真机上有系统字体，是截图环境没有。`);
+    expectTrue(g.han2.hash !== g.tofu.hash, '「删」渲染成了豆腐块 —— 运行环境缺中日韩字体', brief);
+    // 两个不同的汉字必须长得不一样。缺字体时它们会是同一个方块，这条也会红。
+    expectTrue(g.han1.hash !== g.han2.hash, '两个不同的汉字画出来一模一样 —— 它们大概都是同一个方块', brief);
+    // 防夹具坏掉：如果 draw() 本身失灵，所有签名会一起相等而上面几条免费通过。
+    expectTrue(g.ascii.hash !== g.han1.hash, 'ASCII 与汉字的签名相同 —— 是绘制函数坏了，不是字体问题', brief);
+    return `字体族 ${String(g.family).split(',')[0]}｜早 ${g.han1.ink} 墨迹 / 删 ${g.han2.ink} / 基准方块 ${g.tofu.ink}，四个签名互不相同`;
+  }],
+
   ['截图 light-list：浅色列表', async () => {
     await waitFor('浅色背景就位', async () =>
       (await ctx.page.evaluate(() => getComputedStyle(document.body).backgroundColor)) === 'rgb(246, 247, 249)');
@@ -227,7 +291,7 @@ const STEPS = [
     expectEq(new Set(shas).size, shas.length, '互不相同的 sha256 个数');
     // 注意：这条**单独存在时是靠不住的**。上一版三张图各晚了一步，它照样全绿 ——
     // 因为「晚了一步」的三张图确实互不相同。真正在守内容的是每张图那条
-    // 「探针像素 == 行数 x 164」。
+    // 「探针像素 == 行数 x 164」，以及上面那条字形断言。
     const light = ctx.shots.get('light-list');
     const dark = ctx.shots.get('dark-settings');
     expectTrue(Math.abs(light.corner.r - dark.corner.r) > 100, '浅色与深色两张图的背景几乎一样', `light r=${light.corner.r}，dark r=${dark.corner.r}（比差值，不比绝对阈值）`);
