@@ -24,7 +24,8 @@ export const RELEASE_GATES = [
   { slug: 'dist-linux', label: '安装包闸门 · Linux' },
   { slug: 'dist-mac', label: '安装包闸门 · macOS' },
   { slug: 'dist-win', label: '安装包闸门 · Windows' },
-  { slug: 'release-assets', label: '发布资产校验闸门' }
+  { slug: 'release-assets', label: '发布资产校验闸门' },
+  { slug: 'release-mirror', label: '公开仓 Release 同步校验' }
 ];
 
 // 截图流水线（screenshots.yml）的闸门清单。

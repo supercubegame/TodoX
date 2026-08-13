@@ -4,5 +4,6 @@
   "e2e": 18,
   "pack": 4,
   "dist": 6,
-  "release": 6
+  "release": 6,
+  "releaseMirror": 6
 }
