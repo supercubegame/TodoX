@@ -28,10 +28,18 @@ jobs:
         with:
           path: ~/.cache/electron
           key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
-      - name: 装系统依赖
+      # fonts-noto-cjk 是承重的，别删：ubuntu runner 默认不带任何中日韩字体，
+      # 缺了它界面上每个汉字都会渲染成豆腐块，而截图闸门的其它断言（探针像素、
+      # 背景色、体积、sha 互不相同）全都照样通过 —— 实测过一次 7/7 全绿而三张图
+      # 全是方块。现在有一条断言专门守它（见 shoot.mjs 的字形检查）。
+      #
+      # 快闸门也有一条静态断言核对这一行还在。
+      - name: 装系统依赖与中日韩字体
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1
+          sudo apt-get install -y fonts-noto-cjk fonts-noto-color-emoji
+          fc-list :lang=zh | head -n 5
       - name: 装依赖
         run: npm install --no-audit --no-fund
       # xvfb 默认 8 位色深，那会让「背景色等于主题令牌」和「探针像素个数」
