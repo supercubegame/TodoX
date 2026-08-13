@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
 import { Report, GATES, RELEASE_GATES, SHOTS_GATES } from './lib/report.mjs';
+import { SHOTS, SHOT_DIR, MIN_BYTES } from './lib/shots.mjs';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -63,6 +64,10 @@ function walk(dir, out = []) {
   }
   return out;
 }
+// 密钥扫描只看文本文件。截图进仓库之后，二进制里凑巧出现一段密钥形状的字节
+// 就会给出一条谁也看不懂的偶发红 —— 而它防的东西（把密钥藏进 PNG）不现实。
+const BINARY_EXT = ['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.zip', '.asar', '.icns'];
+function isTextFile(f) { return !BINARY_EXT.includes(path.extname(f).toLowerCase()); }
 
 // 字符级扫描器，不用正则。用正则剥注释会在字符串里出现 // 或 /* 的时候整段吃掉
 // 代码 —— 那不是「少抓几个」，是让整类输入凭空消失。
@@ -548,6 +553,24 @@ const CHECKS = [
     return `同一份内容，${a.length} 字节`;
   }],
 
+  // README 里的破图不会让任何东西变红，只会让人以为项目没做完。所以三方对齐：
+  // README 引用了什么、SHOTS 清单说该有什么、磁盘上实际有什么。
+  // 负向那侧也在：多出一张没人引用的图同样红。
+  ['文档：README 引用的截图、SHOTS 清单、磁盘文件三方相等', () => {
+    const readme = readIfExists('README.md');
+    const referenced = [...readme.matchAll(/docs\/screenshots\/([A-Za-z0-9._-]+\.png)/g)].map(m => m[1]);
+    expectTrue(referenced.length > 0, 'README 里一张截图都没引用 —— 是扫描器坏了，不是 README 对了', readme.slice(0, 300));
+    const want = SHOTS.map(s => `${s.slug}.png`).sort();
+    expectEq([...new Set(referenced)].sort(), want, 'README 引用的截图集合');
+    const dir = path.join(ROOT, SHOT_DIR);
+    const onDisk = fs.readdirSync(dir).filter(n => n.toLowerCase().endsWith('.png')).sort();
+    expectEq(onDisk, want, `${SHOT_DIR} 下实际存在的截图集合`);
+    const sizes = want.map(n => ({ n, bytes: fs.statSync(path.join(dir, n)).size }));
+    const empty = sizes.filter(s => s.bytes <= MIN_BYTES).map(s => `${s.n}: ${s.bytes} 字节`);
+    expectEq(empty, [], `小于 ${MIN_BYTES} 字节的截图（像是空图）`);
+    return `${want.length} 张图三方一致：${sizes.map(s => `${s.n} ${(s.bytes / 1024).toFixed(0)}KB`).join('，')}`;
+  }],
+
   // 这条是漏继承的解药。以前登记表是手写的两项，于是**新加的 workflow 文件完全
   // 在扫描范围之外**：它可以自由长出一个没有 pipefail 的 tee，而所有 run 依然
   // 全绿。手写清单永远追不上目录，所以让目录本身成为期望。
@@ -722,14 +745,14 @@ const CHECKS = [
   }],
 
   ['密钥：哨兵在源码与报告里出现 0 次（负向）', () => {
-    const files = walk(ROOT);
+    const files = walk(ROOT).filter(isTextFile);
     const hits = files.filter(f => {
       try { return fs.readFileSync(f, 'utf8').includes(SENTINEL); } catch { return false; }
     }).map(f => path.relative(ROOT, f));
     expectEq(hits, [], '哨兵泄漏的文件');
     const inReport = JSON.stringify(report.toJSON()).includes(SENTINEL);
     expectTrue(!inReport, '哨兵密钥泄漏进了报告本体', '报告会被原样贴到 PR 评论里');
-    return `哨兵（每次运行随机生成）在 ${files.length} 个文件与报告 JSON 中出现 0 次`;
+    return `哨兵（每次运行随机生成）在 ${files.length} 个文本文件与报告 JSON 中出现 0 次`;
   }],
 
   ['密钥：仓库里没有密钥形状的字面量', () => {
@@ -741,13 +764,15 @@ const CHECKS = [
       ['Slack token', new RegExp(['xox', '[abpr]-[A-Za-z0-9-]{12,}'].join(''))]
     ];
     const hits = [];
-    for (const f of walk(ROOT)) {
+    let scanned = 0;
+    for (const f of walk(ROOT).filter(isTextFile)) {
       let text = '';
       try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+      scanned += 1;
       for (const [name, re] of patterns) if (re.test(text)) hits.push(`${path.relative(ROOT, f)}: ${name}`);
     }
     expectEq(hits, [], '密钥形状的字面量');
-    return '4 类密钥形状全部 0 命中（模式由拼接构造，扫描不会抓到自己）';
+    return `${scanned} 个文本文件、4 类密钥形状全部 0 命中（模式由拼接构造，扫描不会抓到自己）`;
   }],
 
   ['自检：标题唯一 + 实际检查数等于清单数', () => {
