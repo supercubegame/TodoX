@@ -116,6 +116,7 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: exit 1
 
+  # 回写钉在 SHA 上，不许 @main。四份 workflow 只能钉同一个，快闸门有断言在守。
   summary:
     name: 回报镜像结果
     if: always()
@@ -123,7 +124,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
     with:
       node-version: '20'
       gates: '[{"name":"公开镜像同步","result":"${{ needs.sync.result }}"}]'

@@ -276,6 +276,9 @@ jobs:
         run: exit 1
 
   # 回写走的是和 verify.yml 同一份共享 workflow，只是换了 composer 入口和 marker。
+  # **钉在 SHA 上，不许 @main**：那是可变引用，上游改一行就会悄悄改掉这四条
+  # 流水线的行为，而回写坏掉的表现是「闸门全绿但没人看得到结论」。快闸门断言
+  # 四份 workflow 钉的 SHA 集合大小恰好为 1 —— 只更新一半也要红。
   summary:
     name: 回报结果
     if: always()
@@ -283,7 +286,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
     with:
       node-version: '20'
       gates: '[{"name":"安装包闸门","result":"${{ needs.dist.result }}"},{"name":"发布 Release","result":"${{ needs.publish.result }}"},{"name":"发布资产校验闸门","result":"${{ needs.verify.result }}"},{"name":"公开仓 Release 同步","result":"${{ needs.mirror.result }}"}]'

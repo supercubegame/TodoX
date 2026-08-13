@@ -95,6 +95,8 @@ jobs:
   # 这个 job 是补上来的。截图流水线一开始没有回写，于是第一次失败时报告只存在
   # 于 CI 日志里 —— 而那是 agent 读不到的地方。从外面看，「跑了但没产出截图」
   # 和「压根没跑」长得一模一样。送不出结论的闸门等于没跑。
+  #
+  # 回写钉在 SHA 上，不许 @main。四份 workflow 只能钉同一个，快闸门有断言在守。
   summary:
     name: 回报截图结果
     if: always()
@@ -102,7 +104,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
     with:
       node-version: '20'
       gates: '[{"name":"截图生成器","result":"${{ needs.shots.result }}"}]'
