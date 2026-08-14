@@ -11,6 +11,10 @@
 // 第三个自问是 2026-08-14 复核 PITFALLS「测不出来的」时加上的：**那一节里
 // 每一条「这个验不了」，我真的试过吗？** 那次抓到一条假结论（多屏坐标，
 // 见下面那条断言的注释）。手法是造变异体，不是读代码判断。
+//
+// 第四个自问是同一天下午加的，它比前三个更便宜也更狠：**把这条断言要守的东西
+// 故意改坏一次，它会红吗？** 那次抓到一条真装饰（令牌守卫，见 mirror 那条）。
+// 「静态扫描」这类断言最容易变成装饰,子串在文件里存在，不等于它在该在的位置上。
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -256,6 +260,21 @@ function runBlocks(text) {
     blocks.push({ line: i + 1, body: body.join('\n') });
   }
   return blocks;
+}
+
+// 「某段脚本里必须出现 X」这类断言，必须先把那段切出来再找 —— 否则它退化成
+// 「整个文件里存在 X」，而同一个文件里到处都有 `exit 1` 这种东西。
+// 2026-08-14 实测抓到的那条装饰就是这么来的（见 mirror 那条断言的注释）。
+//
+// 顺手剔掉 shell 注释行：run 块内部的 `# ...` 是文档，不是会执行的语句。
+// 这和上面 stripYamlComments 是同一条道理，只是层级不同。
+function blocksContaining(text, needle) {
+  return runBlocks(text)
+    .filter(b => b.body.includes(needle))
+    .map(b => ({
+      line: b.line,
+      code: b.body.split('\n').filter(l => !/^\s*#/.test(l)).join('\n')
+    }));
 }
 
 function matrixSlugs(text) {
@@ -1081,7 +1100,24 @@ const CHECKS = [
   // 镜像这条流水线的全部意义是「别把不该给的东西给出去」，所以它自己失效时
   // 必须响亮。三件事在这里守：令牌缺失不许静默跳过、强推保证公开仓历史干净、
   // 提交信息里带源 SHA（审计唯一能区分「同步成功」与「早就不同步了」的凭据）。
-  ['CI：mirror 的触发范围、令牌守卫与源 SHA 痕迹', () => {
+  //
+  // ------------------------------------------------------------------------
+  // 2026-08-14：这条断言的前一版**是装饰**，实测确认过。
+  //
+  // 原文是 `text.includes('MIRROR_TOKEN:-') && text.includes('exit 1')`——
+  // 两个子串各自在**整个文件**里找。而 mirror.yml 末尾那个「闸门失败则失败」
+  // 步骤本来就有一行 `run: exit 1`，跟令牌守卫毫无关系。
+  //
+  // 代价：把守卫里的 exit 1 换成 echo（也就是**恰好退化成静默跳过**，正是这条
+  // 断言存在要防的那件事），它照样全绿；把整个守卫步骤删掉、只留一句提到令牌的
+  // 注释，也照样全绿。两个变异体都活了下来。
+  //
+  // 根因和「注释块被算进上一个 job」是同一个形状，只是**极性相反**：那次是
+  // 「这段里不该出现 X」被注释里的字面量骗过，这次是「这段里必须出现 X」被
+  // 别处的字面量满足。所以那条经验要写成不分极性的版本：
+  // **凡是「某段里有没有 X」，都必须先把那段切出来再找。**
+  // ------------------------------------------------------------------------
+  ['CI：mirror 的触发范围、令牌守卫（块内断言 + 变异体自证）与源 SHA 痕迹', () => {
     const text = wf('mirror');
     const on = onBlock(text);
     expectTrue(on.length > 0, 'mirror.yml 里解析不到 on: 块 —— 扫描器坏了', text.slice(0, 300));
@@ -1091,15 +1127,46 @@ const CHECKS = [
     const jobs = jobBlocks(text);
     expectTrue(jobs.has('sync'), 'mirror.yml 里没有 sync job', [...jobs.keys()].join(','));
     expectEq(jobLevelIfs(jobs.get('sync')), [], 'sync job 上的 job 级 if');
-    // 令牌缺失必须 exit 1。静默跳过和「同步成功」在面板上长得一模一样。
-    expectTrue(text.includes('MIRROR_TOKEN:-') && text.includes('exit 1'), 'mirror.yml 没有在令牌缺失时明确失败', '静默跳过就等于「以为同步了，其实什么都没发生」');
+
+    // 令牌守卫：只在**含 MIRROR_TOKEN 的那个 run 块内部**找退出语句。
+    // 静默跳过和「同步成功」在面板上长得一模一样，所以缺令牌必须让 job 红。
+    const guardBlocks = blocksContaining(text, 'MIRROR_TOKEN:-');
+    expectEq(guardBlocks.length, 1, '含 ${MIRROR_TOKEN:-} 的 run 块个数（0 说明守卫没了，多个说明有重复实现）');
+    expectTrue(/(^|\n)\s*exit 1\b/.test(guardBlocks[0].code),
+      `mirror.yml 第 ${guardBlocks[0].line} 行那个令牌守卫块里没有 exit 1`,
+      '令牌缺失时必须让整个 job 红。静默跳过就等于「以为同步了，其实什么都没发生」，\n' +
+      '而那和「同步成功」在面板上长得一模一样。\n' +
+      '注意：文件别处的 exit 1（比如末尾那个「闸门失败则失败」步骤）不算 —— \n' +
+      '这条断言的前一版就是被那个字面量满足的，实测两个变异体都活了下来。');
+
+    // 源 SHA 痕迹同样是块内的事：它必须在真的推送/提交的那个块里。
+    const shaBlocks = blocksContaining(text, '${GITHUB_SHA:0:7}');
+    expectTrue(shaBlocks.length >= 1, '同步的提交信息里没有源 SHA',
+      '那是审计唯一能区分「同步成功」与「镜像早就停在旧内容上」的凭据');
+    expectTrue(shaBlocks.some(b => b.code.includes('git commit')), '源 SHA 不在真的建提交的那个块里',
+      '写在别处（比如一句 echo）的话，公开仓那边的提交信息里其实没有它');
+
     expectTrue(text.includes('git push --force'), 'mirror.yml 不是强推 —— 公开仓可能留下私有历史', text.slice(0, 400));
-    expectTrue(text.includes('${GITHUB_SHA:0:7}'), '同步的提交信息里没有源 SHA', '那是审计唯一能区分「同步成功」与「镜像早就停在旧内容上」的凭据');
+
+    // 自证：造两个变异体，都必须被抓住。这两个正是上一版放过去的那两个。
+    const guardCheck = t => {
+      const bs = blocksContaining(t, 'MIRROR_TOKEN:-');
+      return bs.length === 1 && /(^|\n)\s*exit 1\b/.test(bs[0].code);
+    };
+    expectTrue(guardCheck(text), '检查器在真文本上应该通过 —— 否则下面两个变异体的判红没有意义');
+    const silent = text.replace(/(\n\s*)exit 1(\n\s*fi)/, "$1echo '没令牌，跳过同步'$2");
+    expectTrue(silent !== text, '构造「静默跳过」变异体时没替换到任何东西 —— 夹具坏了，不是产品对了');
+    expectTrue(!guardCheck(silent), '把守卫里的 exit 1 换成 echo 之后检查器居然没判红 —— 那这条还是装饰',
+      '静默跳过是这条断言唯一要防的东西');
+    const noGuard = text.split('\n').filter(l => !l.includes('MIRROR_TOKEN:-')).join('\n');
+    expectTrue(!guardCheck(noGuard), '守卫整个删掉之后检查器没判红');
+
     const names = tokenSet('mirror', RE_REPORT);
     expectEq([...names].sort(), MIRROR_GATES.map(g => `report-${g.slug}`).sort(), '产物名集合');
     const slugs = tokenSet('mirror', RE_STDOUT);
     expectEq([...slugs].sort(), MIRROR_GATES.map(g => g.slug).sort(), 'stdout 日志 slug 集合');
-    return '只认 main，令牌缺失即红，强推 + 源 SHA 痕迹都在，产物名与 MIRROR_GATES 相等';
+    return `只认 main；令牌守卫在第 ${guardBlocks[0].line} 行那个块内部真的有 exit 1（两个变异体都被抓住：` +
+      `换成静默跳过、整块删掉）；源 SHA 在 git commit 的那个块里；强推在；产物名与 MIRROR_GATES 相等`;
   }],
 
   ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
