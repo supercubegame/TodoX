@@ -16,8 +16,10 @@
 //
 // **而那条顺序断言带来一个自己造出来的盲区**：既然审计时必须还是草稿，这个脚本
 // 这辈子都不可能断言「已经对外可见」那个终态。原来那一段只有一句读回来打印,
-// 打印了没人解析。最后往下数第二条检查因此改成守 workflow 的结构：转正那一块里
-// 必须有一条**会返回退出码**的读回断言。见它自己的注释。
+// 打印了没人解析。倒数第二条检查因此改成守 workflow 的结构：转正那一块里必须有
+// 一条**会返回退出码**的读回断言。**那个检查器住在 scripts/lib/promote-guard.mjs**,
+// verify-mirror.mjs 也调它（那边每次推 main 都跑，补的是「两次发版之间的几周」）。
+// 一份实现两处调用 —— report.mjs 已经因为各留一份而真的分叉过。
 //
 // **倒数第三条是覆盖缺口的解药**：前面每条都只看「当次这个 tag」，所以旁边躺一个
 // 上一轮失败留下的空发布是完全隐形的。往外部系统写东西的审计，除了「我这次
@@ -28,16 +30,17 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Report } from './lib/report.mjs';
 import { MIRROR_REPO } from './lib/mirror.mjs';
+import { promotionGuardProblems, promotionMutants, PROMOTE_MARK } from './lib/promote-guard.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'manifest.json'), 'utf8'));
 const SRC_REPO = process.env.GITHUB_REPOSITORY || 'supercubegame/TodoX';
 const TAG = process.env.TODOX_RELEASE_TAG || '';
-// 和 verify-dist.mjs 的 PLAN、verify-release.mjs 的 EXPECT_TOTAL、release.yml 的
-// 「发布前清点资产」是一组。改一个必须重算另外三个（见 AGENTS.md）。
-// **第五处是 release.yml 转正那一块里的 `-eq 8`** —— 而那一处不用靠人记：
-// 倒数第二条检查会把它解析出来，和这里的 EXPECT_TOTAL 比。
+// 和 verify-dist.mjs 的 PLAN、verify-release.mjs、verify-mirror.mjs、release.yml 的
+// 两处清点是一组。改一个必须重算其余的（见 AGENTS.md）。
+// **release.yml 转正那一块里的 `-eq 8` 不用靠人记**：倒数第二条检查会把它
+// 解析出来和这里的 EXPECT_TOTAL 比。
 const EXPECT_TOTAL = 8;
 const MIN_BYTES = 30 * 1024 * 1024;
 
@@ -129,70 +132,6 @@ function pickTag(list, repo, label) {
   expectTrue(Boolean(hit), `${label}：${repo} 上找不到 ${TAG}`,
     `现有 tag：${list.map(r => `${r.tag_name}${r.draft ? '(草稿)' : ''}`).join(', ')}`);
   return shape(hit);
-}
-
-// ---------------------------------------------------------------- workflow 扫描
-// 只剥**整行**注释。行内 # 一概不动 —— YAML 里 # 可以合法出现在字符串中间，
-// 一个半懂的剥离器比它守的东西更容易错。实际观察到的失效模式全是整行注释
-// （这个仓库一天里抓到过四条）。
-function stripYamlComments(text) {
-  return text.split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
-}
-function runBlocks(text) {
-  const lines = text.split('\n');
-  const blocks = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = /^(\s*)run:\s*\|\s*$/.exec(lines[i]);
-    if (!m) continue;
-    const indent = m[1].length;
-    const body = [];
-    for (let j = i + 1; j < lines.length; j++) {
-      const l = lines[j];
-      if (l.trim() === '') { body.push(l); continue; }
-      const ind = l.length - l.replace(/^\s+/, '').length;
-      if (ind <= indent) break;
-      body.push(l);
-    }
-    blocks.push({ line: i + 1, body: body.join('\n') });
-  }
-  return blocks;
-}
-
-// ============================================================================
-// 转正那一块的守卫。
-//
-// **必须块内检查。** 全文找 `exit 1` 会被文件末尾那个无关的
-// 「闸门失败则失败 -> run: exit 1」骗过去 —— 这个仓库一天前刚为完全一样的
-// 形状红过一次（镜像令牌守卫：两个独立子串搜索，而 exit 1 来自别处）。
-//
-// 守四件事：
-//   1. 全仓恰好一个 run 块在做转正（两个就意味着有一条路绕过了断言）。
-//   2. 那一块里读回了 isDraft / isLatest / 资产数。
-//   3. 那一块里有 exit 1 —— **读回来却不会失败，那就只是打印。**
-//   4. 那一块里对资产数做的等号比较，数值等于 EXPECT_TOTAL。
-//      第 4 条顺手消掉一处新增的硬编码耦合：不然 `-eq 8` 就是第五个会各自漂的 8。
-const PROMOTE_MARK = '--draft=false';
-function promotionGuardProblems(rawWf, expectTotal) {
-  const out = [];
-  const wf = stripYamlComments(rawWf);
-  const blocks = runBlocks(wf).filter(b => b.body.includes(PROMOTE_MARK));
-  if (blocks.length !== 1) {
-    out.push(`把镜像转正（${PROMOTE_MARK}）的 run 块有 ${blocks.length} 个，应当恰好 1 个`);
-    return out;
-  }
-  const body = blocks[0].body;
-  for (const [label, re] of [['isDraft', /isDraft/], ['isLatest', /isLatest/], ['资产数（assets）', /assets/]]) {
-    if (!re.test(body)) out.push(`转正那一块里没有读回 ${label} —— 那个终态就没人核对`);
-  }
-  if (!/(^|\s)exit 1(\s|$)/.test(body)) {
-    out.push('转正那一块里没有 exit 1 —— 读回来了却不会失败，那就只是打印，而日志里有答案不算断言');
-  }
-  const m = /-eq\s+([0-9]+)/.exec(body);
-  if (!m) out.push('转正那一块里没有对资产数做等号比较');
-  else if (Number(m[1]) !== expectTotal) {
-    out.push(`转正那一块要求 ${m[1]} 个资产，与 EXPECT_TOTAL ${expectTotal} 不符 —— 两处各自漂了`);
-  }
-  return out;
 }
 
 const CHECKS = [
@@ -296,77 +235,52 @@ const CHECKS = [
   }],
 
   // ==========================================================================
-  // 这条补的是这个脚本**自己造出来的**盲区。
+  // 这条补的是这个脚本**自己造出来的**盲区：上面第 2 条断言「审计时必须还是
+  // 草稿」，副作用是这个脚本永远跑在转正之前，所以「现在对外可见吗」它断言不了。
   //
-  // 上面第 2 条断言「审计时必须还是草稿」—— 顺序是对的，但它的副作用是：
-  // 这个脚本永远跑在转正之前，所以「公开仓那个 Release 现在对外可见吗」
-  // 这个终态它这辈子都断言不了。而那一步原来的最后一行是
-  // `gh release view ... --json tagName,isDraft,isLatest,url` —— **打印了，**
-  // **没人解析。日志里有答案不算断言。**
+  // 运行时的断言在 release.yml 那一块里（读回来、比四个字段、五次不满足就
+  // exit 1）。**这里守的是它还在** —— 删掉它，一个字符都不会有别的东西红。
   //
-  // 运行时的断言已经放进那一块（读回来、比四个字段、五次不满足就 exit 1）。
-  // 这里守的是**它还在**：删掉它，一个字符都不会有别的东西红。
+  // 时机上这条比 verify-mirror 那条值钱：这个闸门红 -> 转正那一步的 if 不成立
+  // -> 压根不会转正。所以「读回断言被删掉」会在转正**之前**被拦住。
+  // 而 verify-mirror 那条补的是另一段时间：两次发版之间的那几周。
   //
-  // 时机上还有个好处：这个闸门红 -> 转正那一步的 if 不成立 -> 压根不会转正。
-  // 所以「读回断言被删掉」会在转正**之前**被拦住，而不是事后才知道。
+  // **检查器和变异体都在 scripts/lib/promote-guard.mjs，两处调同一份。**
   // ==========================================================================
   ['转正那一块里有一条会返回退出码的读回断言（块内检查 + 变异体自证）', () => {
     const rel = path.join('.github', 'workflows', 'release.yml');
     const rawWf = fs.readFileSync(path.join(ROOT, rel), 'utf8');
     expectEq(promotionGuardProblems(rawWf, EXPECT_TOTAL), [], `${rel} 转正那一块的守卫`);
 
-    // **变异体按行号定位，不用字符串替换。** 这条是造它们的时候现学的：
-    // `exit 1` 这一行在整个文件里出现两次（令牌守卫里也有一个同样缩进的），
-    // 而 JS 的 String.replace 传字符串时**只替换第一个** —— 那会改到令牌守卫
-    // 上去，于是「变异体」压根没动要测的那一块，守卫返回空，
-    // 而我会以为是守卫失灵。**构造变异体时，说谎的往往是夹具。**
-    const lines = rawWf.split('\n');
-    const from = lines.findIndex(l => l.trim() === 'ok=0');
-    const to = lines.findIndex(l => l.trim().startsWith("echo '终态已断言"));
-    const exitAt = lines.findIndex((l, i) => i > from && i < to && l.trim() === 'exit 1');
-    expectTrue(from > 0 && to > from && exitAt > from,
-      '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
-      `ok=0 第 ${from + 1} 行，收尾 echo 第 ${to + 1} 行，块内 exit 1 第 ${exitAt + 1} 行`);
-
-    const mutA = lines.slice();
-    mutA[exitAt] = ' '.repeat(12) + "echo '读回来不对，但我不失败'";
-    const mutants = [
-      ['A 块内 exit 1 换成 echo（静默跳过的经典长相）', mutA.join('\n'), true],
-      ['B 整段读回搬进注释（转正照做）',
-        lines.slice(0, from)
-          .concat(lines.slice(from, to + 1).map(l => `          # ${l.trim()}`))
-          .concat(lines.slice(to + 1)).join('\n'), true],
-      // C 测的是另一件事（两处 8 各自漂开）。「全文找 exit 1」那种旧写法压根
-      // 没有这一条，所以 oldWouldPass 填 null = 不适用。**硬填一个值会让这句**
-      // **自证变成在比一件没意义的事** —— 沙箱里第一版就是这么写的，然后我
-      // 填了 false 而实际是 true，闸门会直接红在夹具上。
-      ['C 资产数悄悄改成 7', rawWf.replace('"$n" -eq 8', '"$n" -eq 7'), null]
-    ];
+    const m = promotionMutants(rawWf);
+    expectTrue(m.located, '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
+      `ok=0 第 ${m.from + 1} 行，收尾 echo 第 ${m.to + 1} 行，块内 exit 1 第 ${m.exitAt + 1} 行`);
 
     const oldBlind = [];
-    for (const [name, text, oldWouldPass] of mutants) {
+    for (const mut of m.mutants) {
       // 先证明变异体是像样的：真的改动了，而且**转正本身还在做**。
-      // 少了这一步，「随便造份坏文件当然会红」就把整个自证掉空了。
-      expectTrue(text !== rawWf, `变异体「${name}」没有真的改动文件 —— 那它证明不了任何事`);
-      expectTrue(text.includes(PROMOTE_MARK), `变异体「${name}」把转正本身也删了 —— 那不是这条断言要抓的坏`);
-      const got = promotionGuardProblems(text, EXPECT_TOTAL);
-      expectTrue(got.length >= 1, `变异体「${name}」没被守卫抓到`, `守卫返回：${JSON.stringify(got)}`);
-      if (oldWouldPass === null) continue;
+      expectTrue(mut.text !== rawWf, `变异体「${mut.name}」没有真的改动文件 —— 那它证明不了任何事`);
+      expectTrue(mut.text.includes(PROMOTE_MARK), `变异体「${mut.name}」把转正本身也删了 —— 那不是这条断言要抓的坏`);
+      const got = promotionGuardProblems(mut.text, EXPECT_TOTAL);
+      expectTrue(got.length >= 1, `变异体「${mut.name}」没被守卫抓到`, `守卫返回：${JSON.stringify(got)}`);
+      if (mut.changedLines !== null) {
+        const base = rawWf.split('\n');
+        const n = mut.text.split('\n').filter((l, i) => l !== base[i]).length;
+        expectEq(n, mut.changedLines, `变异体「${mut.name}」改动的行数`);
+      }
+      if (mut.oldWouldPass === null) continue;
       // 旧写法（在**整个文件**里找 exit 1）会不会放过它 —— 把「为什么必须块内」
       // 也钉进断言，否则半年后有人图省事又改回全文搜索。
-      const oldPasses = /(^|\s)exit 1(\s|$)/.test(text);
-      expectEq(oldPasses, oldWouldPass, `变异体「${name}」在「全文找 exit 1」那种写法下的结果`);
-      if (oldPasses) oldBlind.push(name);
+      const oldPasses = /(^|\s)exit 1(\s|$)/.test(mut.text);
+      expectEq(oldPasses, mut.oldWouldPass, `变异体「${mut.name}」在「全文找 exit 1」那种写法下的结果`);
+      if (oldPasses) oldBlind.push(mut.name);
     }
     expectEq(oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
+    expectTrue(m.mutants[0].text.includes('未配置 MIRROR_TOKEN'), '变异体 A 不该动到令牌守卫那一段');
 
-    // 夹具的反面：A 只许动一行，而且令牌守卫那个 exit 1 必须还在。
-    // 少了这两句，上面那条「按行号定位」的教训就只是注释，没有断言在守。
-    expectEq(mutA.filter((l, i) => l !== lines[i]).length, 1, 'A 改动的行数');
-    expectTrue(mutA.join('\n').includes('未配置 MIRROR_TOKEN'), 'A 不该动到令牌守卫那一段');
-
-    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${exitAt + 1} 行），` +
-      `资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致｜3 个变异体全被抓到，其中 2 个能骗过「全文找 exit 1」的写法`;
+    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${m.exitAt + 1} 行），` +
+      `资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致｜${m.mutants.length} 个变异体全被抓到，` +
+      `其中 2 个能骗过「全文找 exit 1」的写法｜检查器与变异体来自 lib/promote-guard.mjs（verify-mirror 调同一份）`;
   }],
 
   ['自检：本次实际执行的检查数等于清单数', () => {
