@@ -16,10 +16,10 @@
 //
 // **而那条顺序断言带来一个自己造出来的盲区**：既然审计时必须还是草稿，这个脚本
 // 这辈子都不可能断言「已经对外可见」那个终态。原来那一段只有一句读回来打印,
-// 打印了没人解析。倒数第二条检查因此改成守 workflow 的结构：转正那一块里必须有
-// 一条**会返回退出码**的读回断言。**那个检查器住在 scripts/lib/promote-guard.mjs**,
-// verify-mirror.mjs 也调它（那边每次推 main 都跑，补的是「两次发版之间的几周」）。
-// 一份实现两处调用 —— report.mjs 已经因为各留一份而真的分叉过。
+// 打印了没人解析。倒数第二条检查因此改成守 workflow 的结构。**检查器、变异体、
+// 自证循环都住在 scripts/lib/promote-guard.mjs**,verify-mirror.mjs 也调它
+// （那边每次推 main 都跑，补的是「两次发版之间的几周」）。一份实现两处调用 ——
+// report.mjs 已经因为各留一份而真的分叉过。
 //
 // **倒数第三条是覆盖缺口的解药**：前面每条都只看「当次这个 tag」，所以旁边躺一个
 // 上一轮失败留下的空发布是完全隐形的。往外部系统写东西的审计，除了「我这次
@@ -30,7 +30,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Report } from './lib/report.mjs';
 import { MIRROR_REPO } from './lib/mirror.mjs';
-import { promotionGuardProblems, promotionMutants, PROMOTE_MARK } from './lib/promote-guard.mjs';
+import { promotionGuardProblems, promotionSelfProofProblems } from './lib/promote-guard.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
@@ -38,7 +38,7 @@ const MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'manifest
 const SRC_REPO = process.env.GITHUB_REPOSITORY || 'supercubegame/TodoX';
 const TAG = process.env.TODOX_RELEASE_TAG || '';
 // 和 verify-dist.mjs 的 PLAN、verify-release.mjs、verify-mirror.mjs、release.yml 的
-// 两处清点是一组。改一个必须重算其余的（见 AGENTS.md）。
+// 三处清点是一组。改一个必须重算其余的（见 AGENTS.md）。
 // **release.yml 转正那一块里的 `-eq 8` 不用靠人记**：倒数第二条检查会把它
 // 解析出来和这里的 EXPECT_TOTAL 比。
 const EXPECT_TOTAL = 8;
@@ -244,43 +244,18 @@ const CHECKS = [
   // 时机上这条比 verify-mirror 那条值钱：这个闸门红 -> 转正那一步的 if 不成立
   // -> 压根不会转正。所以「读回断言被删掉」会在转正**之前**被拦住。
   // 而 verify-mirror 那条补的是另一段时间：两次发版之间的那几周。
-  //
-  // **检查器和变异体都在 scripts/lib/promote-guard.mjs，两处调同一份。**
   // ==========================================================================
   ['转正那一块里有一条会返回退出码的读回断言（块内检查 + 变异体自证）', () => {
     const rel = path.join('.github', 'workflows', 'release.yml');
     const rawWf = fs.readFileSync(path.join(ROOT, rel), 'utf8');
     expectEq(promotionGuardProblems(rawWf, EXPECT_TOTAL), [], `${rel} 转正那一块的守卫`);
-
-    const m = promotionMutants(rawWf);
-    expectTrue(m.located, '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
-      `ok=0 第 ${m.from + 1} 行，收尾 echo 第 ${m.to + 1} 行，块内 exit 1 第 ${m.exitAt + 1} 行`);
-
-    const oldBlind = [];
-    for (const mut of m.mutants) {
-      // 先证明变异体是像样的：真的改动了，而且**转正本身还在做**。
-      expectTrue(mut.text !== rawWf, `变异体「${mut.name}」没有真的改动文件 —— 那它证明不了任何事`);
-      expectTrue(mut.text.includes(PROMOTE_MARK), `变异体「${mut.name}」把转正本身也删了 —— 那不是这条断言要抓的坏`);
-      const got = promotionGuardProblems(mut.text, EXPECT_TOTAL);
-      expectTrue(got.length >= 1, `变异体「${mut.name}」没被守卫抓到`, `守卫返回：${JSON.stringify(got)}`);
-      if (mut.changedLines !== null) {
-        const base = rawWf.split('\n');
-        const n = mut.text.split('\n').filter((l, i) => l !== base[i]).length;
-        expectEq(n, mut.changedLines, `变异体「${mut.name}」改动的行数`);
-      }
-      if (mut.oldWouldPass === null) continue;
-      // 旧写法（在**整个文件**里找 exit 1）会不会放过它 —— 把「为什么必须块内」
-      // 也钉进断言，否则半年后有人图省事又改回全文搜索。
-      const oldPasses = /(^|\s)exit 1(\s|$)/.test(mut.text);
-      expectEq(oldPasses, mut.oldWouldPass, `变异体「${mut.name}」在「全文找 exit 1」那种写法下的结果`);
-      if (oldPasses) oldBlind.push(mut.name);
-    }
-    expectEq(oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
-    expectTrue(m.mutants[0].text.includes('未配置 MIRROR_TOKEN'), '变异体 A 不该动到令牌守卫那一段');
-
-    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${m.exitAt + 1} 行），` +
-      `资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致｜${m.mutants.length} 个变异体全被抓到，` +
-      `其中 2 个能骗过「全文找 exit 1」的写法｜检查器与变异体来自 lib/promote-guard.mjs（verify-mirror 调同一份）`;
+    const proof = promotionSelfProofProblems(rawWf, EXPECT_TOTAL);
+    expectEq(proof.problems, [], '变异体自证');
+    expectEq(proof.oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
+    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${proof.exitAt + 1} 行），` +
+      `资产数比较在第 ${proof.eqAt + 1} 行、值为 ${EXPECT_TOTAL}｜${proof.mutants.length} 个变异体全被抓到，` +
+      `每个都断言过「改动落在转正那一块里面」，其中 2 个能骗过「全文找 exit 1」的写法｜` +
+      `检查器与自证来自 lib/promote-guard.mjs（verify-mirror 调同一份）`;
   }],
 
   ['自检：本次实际执行的检查数等于清单数', () => {
