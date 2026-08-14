@@ -264,6 +264,13 @@ jobs:
       # 终态,于是「公开仓那个 Release 现在对外可见吗」一条断言都没有。
       # 日志里有答案而没有断言，等于没有。
       #
+      # **别在布尔字段上用 jq 的 `//`。** 上一版写的是 `.isDraft // empty`，
+      # 而 jq 的 `//` 把 `false` 和 `null` 一样当成「缺失」—— 于是转正成功
+      # （isDraft=false）时那个变量是空字符串，这条断言在**成功那一侧永远判红**。
+      # 沙箱里拿假 gh 输出量出来的：六个用例全红，连正常那个都红。
+      # 那不是「安全的红」—— 它会让每次发版都卡在最后一步，然后人学会绕过它。
+      # 现在直接取 `.isDraft`（false / true / null 原样打印）。
+      #
       # 读回来放个循环是因为刚转正时列表接口偶尔还没一致。**循环不许削弱断言**：
       # 五次都不满足就 exit 1，而不是 `|| true` 然后往下走。
       - name: 审计通过才转正，并读回来断言终态
@@ -279,9 +286,9 @@ jobs:
           ok=0
           for i in 1 2 3 4 5; do
             live=$(gh release view "$TAG" --repo "$MIRROR" --json tagName,isDraft,isLatest,url,assets 2>/dev/null || echo '{}')
-            draft=$(jq -r '.isDraft // empty' <<<"$live" 2>/dev/null || echo '')
-            latest=$(jq -r '.isLatest // empty' <<<"$live" 2>/dev/null || echo '')
-            tag=$(jq -r '.tagName // empty' <<<"$live" 2>/dev/null || echo '')
+            draft=$(jq -r '.isDraft' <<<"$live" 2>/dev/null || echo '')
+            latest=$(jq -r '.isLatest' <<<"$live" 2>/dev/null || echo '')
+            tag=$(jq -r '.tagName' <<<"$live" 2>/dev/null || echo '')
             n=$(jq -r '.assets | length' <<<"$live" 2>/dev/null || echo 0)
             echo "第 $i 次读回：isDraft=$draft isLatest=$latest tag=$tag assets=$n"
             if [ "$draft" = 'false' ] && [ "$latest" = 'true' ] && [ "$tag" = "$TAG" ] && [ "$n" -eq 8 ]; then
