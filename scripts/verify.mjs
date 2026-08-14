@@ -7,6 +7,10 @@
 //
 // 第二个自问同样重要：**我在乎的属性里，有哪一个完全没有断言在看？**
 // 覆盖缺口和空断言在报告上长得一模一样 —— 都是全绿。
+//
+// 第三个自问是 2026-08-14 复核 PITFALLS「测不出来的」时加上的：**那一节里
+// 每一条「这个验不了」，我真的试过吗？** 那次抓到一条假结论（多屏坐标，
+// 见下面那条断言的注释）。手法是造变异体，不是读代码判断。
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -483,6 +487,60 @@ const CHECKS = [
     return '(-500,-500) -> (0,0)，(5000,5000) -> (480,400)';
   }],
 
+  // 这条是 2026-08-14 逐条复核 PITFALLS「测不出来的」时补上的，而且它补的是
+  // 那一节里**一句写错的话**：「clampBounds 的多屏分支在 CI 里根本走不到」。
+  //
+  // 那句话把两件事混成了一件。端到端闸门走不到是真的 —— xvfb 里没有窗口管理器，
+  // 也只有一个屏。但 **clampBounds 是纯函数，area 只是个普通参数**：快闸门想喂
+  // 什么工作区就喂什么。把「端到端测不了」写成「测不了」，代价是那个方向被
+  // 永久豁免了监督 —— 没人会去核对一件已经宣布无法核对的事。
+  //
+  // 代价是实测出来的，不是推的：上面那两条断言喂的 area 原点全是 (0,0)，于是把
+  // 函数里的 a.x / a.y 整个换成字面量 0，**58 条断言一条都不会红**。也就是说
+  // 「窗口能不能落到副屏上」此刻完全没有断言在看,而覆盖缺口和空断言在报告上
+  // 长得一模一样，都是全绿。
+  //
+  // 所以这条自带负向孪生：现场造那个「把原点当成 0」的变异体，要求四组输入
+  // **全部**抓住它。并且先证明它在 (0,0) 工作区上与真货结果一致 —— 那正是它
+  // 一直藏得住的原因，也是这条自证不至于变成「随便造个坏函数当然会红」的关键。
+  ['窗口：非零原点的工作区也夹得对（副屏 / 负坐标 / 任务栏偏移），含变异体自证', () => {
+    const c = getCore();
+    const RIGHT = { x: 1920, y: 0, width: 1920, height: 1080 };
+    const cases = [
+      ['右侧副屏：主屏坐标被拉进副屏', { x: 100, y: 100, width: 800, height: 600 }, RIGHT, { x: 1920, y: 100, width: 800, height: 600 }],
+      ['副屏内的坐标原样保留', { x: 2000, y: 200, width: 800, height: 600 }, RIGHT, { x: 2000, y: 200, width: 800, height: 600 }],
+      ['左侧副屏：原点是负数', { x: 500, y: 0, width: 800, height: 600 }, { x: -1920, y: 0, width: 1920, height: 1080 }, { x: -800, y: 0, width: 800, height: 600 }],
+      ['顶部任务栏的 y 偏移', { x: 0, y: 0, width: 800, height: 600 }, { x: 0, y: 48, width: 1920, height: 1032 }, { x: 0, y: 48, width: 800, height: 600 }]
+    ];
+    for (const [name, bounds, area, want] of cases) expectEq(c.clampBounds(bounds, area), want, name);
+
+    // 变异体：只把工作区原点当成 0，其它逻辑逐字照抄。
+    function originBlind(b, a) {
+      const w = Math.max(480, Math.min(Math.round(b.width), a.width));
+      const h = Math.max(360, Math.min(Math.round(b.height), a.height));
+      return {
+        x: Math.max(0, Math.min(Math.round(b.x), a.width - w)),
+        y: Math.max(0, Math.min(Math.round(b.y), a.height - h)),
+        width: w, height: h
+      };
+    }
+    // 先证明它是个**像样的**变异体：在零原点的工作区上它和真货完全一致。
+    // 这一步不做的话，这条自证就退化成「随便造个坏函数当然会红」。
+    const zero = { x: 0, y: 0, width: 1280, height: 1000 };
+    for (const b of [{ x: -500, y: -500, width: 800, height: 600 }, { x: 5000, y: 5000, width: 800, height: 600 }]) {
+      expectEq(originBlind(b, zero), c.clampBounds(b, zero),
+        '变异体在 (0,0) 工作区上应与真货一致 —— 那正是它藏得住的原因');
+    }
+    // 再要求非零原点的四组输入全部把它抓出来。活下来一组就说明那组是装饰。
+    const survived = cases
+      .filter(([, b, a]) => isDeepStrictEqual(originBlind(b, a), c.clampBounds(b, a)))
+      .map(([n]) => n);
+    expectEq(survived, [], '「把工作区原点当成 0」的变异体活下来的输入');
+
+    return `${cases.length} 组非零原点输入全部夹对；变异体在 (0,0) 工作区上与真货一致（所以上面两条放它过去），` +
+      `在这 ${cases.length} 组上全部被抓住`;
+  }],
+
   ['存档：序列化往返深度相等且不标 recovered', () => {
     const c = getCore();
     const s = c.setSettings(sample(), { theme: 'dark', fontScale: 120 });
@@ -820,6 +878,9 @@ const CHECKS = [
   //
   // 现在要求 40 位 SHA，并且**四份 workflow 钉的 SHA 集合大小必须为 1**：
   // 只更新一半比全钉 @main 更糟，两边行为会分叉而没有任何断言看得见。
+  //
+  // 它守不住的那一半（钉的那个提交，它自己的自检当时是不是绿的）写在
+  // PITFALLS「测不出来的」里 —— 2026-08-14 复核时新发现的洞。
   ['CI：回写 job 用共享 workflow、钉在 40 位 SHA、四份钉同一个、本地零 steps', () => {
     const bad = [];
     const pins = new Set();
