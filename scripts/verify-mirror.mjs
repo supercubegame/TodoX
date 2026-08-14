@@ -25,7 +25,7 @@ import {
   MIRROR_REPO, ALLOW_TOP, DENY_PATHS, REQUIRE_FILES,
   DENY_SCRIPT_KEYS, DENY_DEV_DEPS, isDenied, topOf
 } from './lib/mirror.mjs';
-import { promotionGuardProblems, promotionMutants, PROMOTE_MARK } from './lib/promote-guard.mjs';
+import { promotionGuardProblems, promotionSelfProofProblems } from './lib/promote-guard.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
@@ -33,7 +33,7 @@ const MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'manifest
 const SRC_SHA = process.env.GITHUB_SHA || '';
 const SRC_REPO = process.env.GITHUB_REPOSITORY || 'supercubegame/TodoX';
 // 和 verify-dist.mjs 的 PLAN、verify-release.mjs、verify-release-mirror.mjs、
-// release.yml 里两处清点是一组。改一个必须重算其余的（见 AGENTS.md）。
+// release.yml 里三处清点是一组。改一个必须重算其余的（见 AGENTS.md）。
 const EXPECT_TOTAL = 8;
 const report = new Report('公开镜像同步');
 
@@ -178,50 +178,24 @@ const CHECKS = [
   //
   // 同一个守卫在 verify-release-mirror.mjs 里也有一条，那边能**拦住发布**
   // （它红 -> 转正那一步的 if 不成立 -> 压根不会转正），那是它最值钱的地方。
-  // 但发版可能几周一次,中间那几周没有任何东西看着这段守卫，而「几周之后才
-  // 发现读回断言被删了」和「没有守卫」差别不大。这条补的就是那几周。
+  // 但发版可能几周一次,中间那几周没有任何东西看着这段守卫。这条补的就是那几周。
   //
-  // **两处调用的是 lib 里同一份实现**（scripts/lib/promote-guard.mjs）。
-  // 这个项目里 report.mjs 已经在两个仓库各有一份并且真的分叉了，而没有任何
-  // 断言看得见 —— 同一个形状不许在同一个仓库里再长一次。
+  // **而它上线第一天就证明了自己**：搬过来之后在 main 上第一次跑就红了 ——
+  // 抓到的是**自己那个变异体造错了**（改到了 publish job）。发布侧那份代码
+  // 一模一样，如果没搬过来，这个错要等到下次真发版才会现形。
   //
-  // 顺手说清这条**不能**证明什么：它证明「那段读回断言还在 release.yml 里」，
-  // 证明不了「上次发版时它真的判红过」。后者只有真发一次版才知道,
-  // 而为了验它去造一个假发布，会在公开仓给下载的人留下一个假版本。不值。
+  // 检查器、变异体、自证循环全在 scripts/lib/promote-guard.mjs，**两处调同一份**。
   // ==========================================================================
   ['release.yml 转正那一块仍有一条会返回退出码的读回断言（块内检查 + 变异体自证）', () => {
     const rel = path.join('.github', 'workflows', 'release.yml');
     const rawWf = fs.readFileSync(path.join(ROOT, rel), 'utf8');
     expectEq(promotionGuardProblems(rawWf, EXPECT_TOTAL), [], `${rel} 转正那一块的守卫`);
-
-    const m = promotionMutants(rawWf);
-    expectTrue(m.located, '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
-      `ok=0 第 ${m.from + 1} 行，收尾 echo 第 ${m.to + 1} 行，块内 exit 1 第 ${m.exitAt + 1} 行`);
-
-    const oldBlind = [];
-    for (const mut of m.mutants) {
-      // 先证明变异体是像样的：真的改动了，而且**转正本身还在做**。
-      // 少了这一步，「随便造份坏文件当然会红」就把整个自证掉空了。
-      expectTrue(mut.text !== rawWf, `变异体「${mut.name}」没有真的改动文件 —— 那它证明不了任何事`);
-      expectTrue(mut.text.includes(PROMOTE_MARK), `变异体「${mut.name}」把转正本身也删了 —— 那不是这条断言要抓的坏`);
-      const got = promotionGuardProblems(mut.text, EXPECT_TOTAL);
-      expectTrue(got.length >= 1, `变异体「${mut.name}」没被守卫抓到`, `守卫返回：${JSON.stringify(got)}`);
-      if (mut.changedLines !== null) {
-        const n = mut.text.split('\n').filter((l, i) => l !== rawWf.split('\n')[i]).length;
-        expectEq(n, mut.changedLines, `变异体「${mut.name}」改动的行数`);
-      }
-      if (mut.oldWouldPass === null) continue;
-      const oldPasses = /(^|\s)exit 1(\s|$)/.test(mut.text);
-      expectEq(oldPasses, mut.oldWouldPass, `变异体「${mut.name}」在「全文找 exit 1」那种写法下的结果`);
-      if (oldPasses) oldBlind.push(mut.name);
-    }
-    expectEq(oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
-    // A 只许动一行，而且令牌守卫那个 exit 1 必须还在 —— 否则「按行号定位」
-    // 那个教训就只是注释，没有断言在守。
-    expectTrue(m.mutants[0].text.includes('未配置 MIRROR_TOKEN'), '变异体 A 不该动到令牌守卫那一段');
-
-    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${m.exitAt + 1} 行），` +
-      `资产数 ${EXPECT_TOTAL} 对得上｜${m.mutants.length} 个变异体全被抓到，其中 2 个能骗过「全文找 exit 1」的写法`;
+    const proof = promotionSelfProofProblems(rawWf, EXPECT_TOTAL);
+    expectEq(proof.problems, [], '变异体自证');
+    expectEq(proof.oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
+    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${proof.exitAt + 1} 行），` +
+      `资产数比较在第 ${proof.eqAt + 1} 行、值为 ${EXPECT_TOTAL}｜${proof.mutants.length} 个变异体全被抓到，` +
+      `每个都断言过「改动落在转正那一块里面」，其中 2 个能骗过「全文找 exit 1」的写法`;
   }],
 
   // 这条原来写的是「report.checks.length + 1 === CHECKS.length」—— 两个数会
