@@ -165,13 +165,24 @@ function runBlocks(text) {
 // 「闸门失败则失败 -> run: exit 1」骗过去 —— 这个仓库一天前刚为完全一样的
 // 形状红过一次（镜像令牌守卫：两个独立子串搜索，而 exit 1 来自别处）。
 //
-// 守四件事：
+// 守五件事：
 //   1. 全仓恰好一个 run 块在做转正（两个就意味着有一条路绕过了断言）。
 //   2. 那一块里读回了 isDraft / isLatest / 资产数。
 //   3. 那一块里有 exit 1 —— **读回来却不会失败，那就只是打印。**
 //   4. 那一块里对资产数做的等号比较，数值等于 EXPECT_TOTAL。
 //      第 4 条顺手消掉一处新增的硬编码耦合：不然 `-eq 8` 就是第五个会各自漂的 8。
+//   5. **布尔字段不许用 jq 的 `//`。** 见下。
+//
+// 第 5 条是 2026-08-14 沙箱里抓到的一个真 bug，而它的形状很值钱：
+// 上一版写的是 `jq -r '.isDraft // empty'`，看起来是「取不到就当空」的好习惯。
+// 但 **jq 的 `//` 把 `false` 和 `null` 一样当成缺失** —— 于是转正成功那一刻
+// （isDraft 恰好是 `false`）那个变量是空字符串，这条断言**在成功那一侧永远判红**。
+// 拿假 gh 输出量过：六个用例全红，连正常那个都红。
+//
+// 它不是「安全的红」：每次发版都会卡在最后一步，而人对着一条永远红的断言
+// 只会学会绕过它。**一条永远为真的断言是装饰，一条永远为假的断言更糟。**
 const PROMOTE_MARK = '--draft=false';
+const BOOL_JQ_DEFAULT = /\.(isDraft|isLatest)\s*\/\//;
 function promotionGuardProblems(rawWf, expectTotal) {
   const out = [];
   const wf = stripYamlComments(rawWf);
@@ -191,6 +202,10 @@ function promotionGuardProblems(rawWf, expectTotal) {
   if (!m) out.push('转正那一块里没有对资产数做等号比较');
   else if (Number(m[1]) !== expectTotal) {
     out.push(`转正那一块要求 ${m[1]} 个资产，与 EXPECT_TOTAL ${expectTotal} 不符 —— 两处各自漂了`);
+  }
+  if (BOOL_JQ_DEFAULT.test(body)) {
+    out.push('转正那一块在 isDraft / isLatest 上用了 jq 的 `//` —— 那个操作符把 false 也当成缺失，' +
+      '于是转正成功（isDraft=false）时变量是空串，这条断言会在**成功那一侧永远判红**。直接取 .isDraft');
   }
   return out;
 }
@@ -305,7 +320,7 @@ const CHECKS = [
   // **没人解析。日志里有答案不算断言。**
   //
   // 运行时的断言已经放进那一块（读回来、比四个字段、五次不满足就 exit 1）。
-  // 这里守的是**它还在**：删掉它，一个字符都不会有别的东西红。
+  // 这里守的是**它还在、而且写法没坑**：删掉它，一个字符都不会有别的东西红。
   //
   // 时机上还有个好处：这个闸门红 -> 转正那一步的 if 不成立 -> 压根不会转正。
   // 所以「读回断言被删掉」会在转正**之前**被拦住，而不是事后才知道。
@@ -315,11 +330,8 @@ const CHECKS = [
     const rawWf = fs.readFileSync(path.join(ROOT, rel), 'utf8');
     expectEq(promotionGuardProblems(rawWf, EXPECT_TOTAL), [], `${rel} 转正那一块的守卫`);
 
-    // **变异体按行号定位，不用字符串替换。** 这条是造它们的时候现学的：
-    // `exit 1` 这一行在整个文件里出现两次（令牌守卫里也有一个同样缩进的），
-    // 而 JS 的 String.replace 传字符串时**只替换第一个** —— 那会改到令牌守卫
-    // 上去，于是「变异体」压根没动要测的那一块，守卫返回空，
-    // 而我会以为是守卫失灵。**构造变异体时，说谎的往往是夹具。**
+    // 四个变异体。第三个是**正向对照那一侧的反面**（无关改动不许被误判），
+    // 第四个是 2026-08-14 沙箱里抓到的那个真 bug。
     const lines = rawWf.split('\n');
     const from = lines.findIndex(l => l.trim() === 'ok=0');
     const to = lines.findIndex(l => l.trim().startsWith("echo '终态已断言"));
@@ -328,6 +340,11 @@ const CHECKS = [
       '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
       `ok=0 第 ${from + 1} 行，收尾 echo 第 ${to + 1} 行，块内 exit 1 第 ${exitAt + 1} 行`);
 
+    // **变异体按行号定位，不用字符串替换。** 这条是造它们的时候现学的：
+    // `exit 1` 这一行在整个文件里出现两次（令牌守卫里也有一个同样缩进的），
+    // 而 JS 的 String.replace 传字符串时**只替换第一个** —— 那会改到令牌守卫
+    // 上去，于是「变异体」压根没动要测的那一块，守卫返回空，
+    // 而我会以为是守卫失灵。**构造变异体时，说谎的往往是夹具。**
     const mutA = lines.slice();
     mutA[exitAt] = ' '.repeat(12) + "echo '读回来不对，但我不失败'";
     const mutants = [
@@ -340,7 +357,12 @@ const CHECKS = [
       // 没有这一条，所以 oldWouldPass 填 null = 不适用。**硬填一个值会让这句**
       // **自证变成在比一件没意义的事** —— 沙箱里第一版就是这么写的，然后我
       // 填了 false 而实际是 true，闸门会直接红在夹具上。
-      ['C 资产数悄悄改成 7', rawWf.replace('"$n" -eq 8', '"$n" -eq 7'), null]
+      ['C 资产数悄悄改成 7', rawWf.replace('"$n" -eq 8', '"$n" -eq 7'), null],
+      // D 是真 bug 的复现：给布尔字段加上「取不到就当空」的默认值。
+      // 它看起来是好习惯，实际让断言在**成功那一侧**永远判红。
+      ['D 给 isDraft / isLatest 加回 jq 的 // empty',
+        rawWf.replace("jq -r '.isDraft'", "jq -r '.isDraft // empty'")
+          .replace("jq -r '.isLatest'", "jq -r '.isLatest // empty'"), true]
     ];
 
     const oldBlind = [];
@@ -358,15 +380,22 @@ const CHECKS = [
       expectEq(oldPasses, oldWouldPass, `变异体「${name}」在「全文找 exit 1」那种写法下的结果`);
       if (oldPasses) oldBlind.push(name);
     }
-    expectEq(oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
+    expectEq(oldBlind.length, 3, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
 
     // 夹具的反面：A 只许动一行，而且令牌守卫那个 exit 1 必须还在。
     // 少了这两句，上面那条「按行号定位」的教训就只是注释，没有断言在守。
     expectEq(mutA.filter((l, i) => l !== lines[i]).length, 1, 'A 改动的行数');
     expectTrue(mutA.join('\n').includes('未配置 MIRROR_TOKEN'), 'A 不该动到令牌守卫那一段');
 
+    // D 那条检查器本身的两侧：真文件不许命中，只改一侧也要命中。
+    // 「加了个新正则」和「那个正则真的在守」是两件事。
+    expectTrue(!BOOL_JQ_DEFAULT.test(rawWf), '真文件里不该有 isDraft/isLatest 上的 jq //');
+    expectTrue(BOOL_JQ_DEFAULT.test(rawWf.replace("jq -r '.isDraft'", "jq -r '.isDraft // empty'")),
+      '只给 isDraft 一侧加上 // 也必须命中');
+
     return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${exitAt + 1} 行），` +
-      `资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致｜3 个变异体全被抓到，其中 2 个能骗过「全文找 exit 1」的写法`;
+      `资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致，布尔字段没用 jq 的 //｜` +
+      `4 个变异体全被抓到，其中 3 个能骗过「全文找 exit 1」的写法`;
   }],
 
   ['自检：本次实际执行的检查数等于清单数', () => {
