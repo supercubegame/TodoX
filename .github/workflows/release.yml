@@ -171,6 +171,11 @@ jobs:
   # 非草稿，那次上传失败后在公开仓留下一个「对外可见但 0 个资产」的 Release，
   # 从外面看和正常的一模一样。草稿是个看得见的失败态。
   #
+  # **而顺序承重带来一个后果：镜像闸门断言的是「此刻还是草稿」，所以它这辈子**
+  # **都不可能断言「已经对外可见」那个终态。** 那一段原来只有一句读回来打印,
+  # 打印了没人解析，于是这条链最后一步完全没人守。现在转正那一步自己读回来
+  # 并断言，退出码是真的。
+  #
   # 这个 job **没有 job 级 if**：条件写歪会让它静默永不执行，而 run 依然全绿。
   # publish 挂了它会因依赖失败被跳过，那时 composer 报「没有产出报告」——
   # 响亮，而且原因就在同一条评论里（publish 的 result 也在 gates 数组里）。
@@ -252,7 +257,16 @@ jobs:
 
       # 审计通过了才对外可见。审计红的时候公开仓上留下的是一个草稿,
       # 别人下载不到半成品，而我看得见它红在哪。
-      - name: 审计通过才转正
+      #
+      # **转正之后必须读回来断言，不是打印。** 这一步原来的最后一行是
+      # `gh release view ... --json tagName,isDraft,isLatest,url` —— 打印了，
+      # 没人解析。而镜像闸门断言的是「此刻还是草稿」，它结构上不可能断言这个
+      # 终态,于是「公开仓那个 Release 现在对外可见吗」一条断言都没有。
+      # 日志里有答案而没有断言，等于没有。
+      #
+      # 读回来放个循环是因为刚转正时列表接口偶尔还没一致。**循环不许削弱断言**：
+      # 五次都不满足就 exit 1，而不是 `|| true` 然后往下走。
+      - name: 审计通过才转正，并读回来断言终态
         if: steps.gate.outcome == 'success'
         shell: bash
         env:
@@ -262,7 +276,27 @@ jobs:
         run: |
           set -euo pipefail
           gh release edit "$TAG" --repo "$MIRROR" --draft=false --latest
-          gh release view "$TAG" --repo "$MIRROR" --json tagName,isDraft,isLatest,url
+          ok=0
+          for i in 1 2 3 4 5; do
+            live=$(gh release view "$TAG" --repo "$MIRROR" --json tagName,isDraft,isLatest,url,assets 2>/dev/null || echo '{}')
+            draft=$(jq -r '.isDraft // empty' <<<"$live" 2>/dev/null || echo '')
+            latest=$(jq -r '.isLatest // empty' <<<"$live" 2>/dev/null || echo '')
+            tag=$(jq -r '.tagName // empty' <<<"$live" 2>/dev/null || echo '')
+            n=$(jq -r '.assets | length' <<<"$live" 2>/dev/null || echo 0)
+            echo "第 $i 次读回：isDraft=$draft isLatest=$latest tag=$tag assets=$n"
+            if [ "$draft" = 'false' ] && [ "$latest" = 'true' ] && [ "$tag" = "$TAG" ] && [ "$n" -eq 8 ]; then
+              ok=1
+              jq -r '.url' <<<"$live"
+              break
+            fi
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo '转正之后读回来的终态不对 —— 公开仓那个 Release 现在不是「对外可见 + latest + 8 个资产」。'
+            echo '注意：这一步失败时公开仓上留下的可能是一个已经转正但资产不全的发布，去手工看一眼。'
+            exit 1
+          fi
+          echo '终态已断言：对外可见、标记为 latest、8 个资产。'
 
       - name: 上传报告
         if: always()

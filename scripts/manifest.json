@@ -6,7 +6,7 @@
   "pack": 4,
   "dist": 6,
   "release": 6,
-  "releaseMirror": 8,
+  "releaseMirror": 9,
   "attest": 7,
   "_attest": "回写送达核对。它不在 GATES 里 - 它跑在报告写完之后，不是一条被合成进那条评论的闸门。"
 }
