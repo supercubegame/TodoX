@@ -81,7 +81,7 @@ const BUDGETS = {
   query: 15,          // 稳态单次查询的 p95（n = 2000，含过滤 + 搜索 + 排序）
   saveLoad: 1500,     // 2000 条存档 序列化 + 反序列化 往返
   historyHeapMB: 12,  // 50 层撤销栈带来的堆增长
-  scaleRatio: 6       // 数据量 x4 时耗时的上限倍数（n log n 约 4.3）
+  scaleRatio: 6       // 数据量 x4 时耗时的上限倍数（见下面那条断言的地板说明）
 };
 const usedBudgets = new Set();
 function budget(key) {
@@ -146,6 +146,14 @@ function heapMB() {
   return process.memoryUsage().heapUsed / (1024 * 1024);
 }
 function ms(n) { return `${n.toFixed(n < 10 ? 3 : 1)}ms`; }
+
+// 测一轮「小集合 → 大集合」的耗时比值。**两轮各自独立**，用来把「余量薄」和
+// 「其实在抛硬币」分开 —— 单轮的话这两件事在报告上长得一模一样。
+function ratioRound(fn) {
+  const small = best(5, () => timed(() => fn(M.state)));
+  const big = best(5, () => timed(() => fn(M.big)));
+  return { small: small, big: big, r: big.perOp / small.perOp };
+}
 
 // -------------------------------------------------------------------- 压测集
 const N = 2000;    // 一个真人可能真的攒到的量级
@@ -310,29 +318,55 @@ const CHECKS = [
     return `${(raw.length / 1048576).toFixed(2)} MB 存档往返 ${ms(elapsed)}（预算 ${ms(limit)}），recovered=false 且字节级无损`;
   }],
 
-  ['规模比值：数据量 x4，查询与单次写入的耗时都不超过 6 倍（不是二次）', () => {
+  // ======================================================================
+  // 这条断言的**地板是 4.0，不是 0**。单次新增在不可变核心下必然是 O(n)：
+  // 查重扫一遍 + `todos.concat` 复制一遍，两件都是 O(n)，所以数据量翻 4 倍
+  // 耗时就翻 4 倍。
+  //
+  // **加索引解决不了这件事**，写下来免得下次有人再试：索引要住在 state 里，
+  // 而 state 不可变 —— 每次插入都得复制一份索引，那本身就是 O(n)，净收益零。
+  // 用原型链做免复制的索引会让查询退化成 O(链深)，更糟。而且就算查重完全
+  // 免费，那一遍数组复制还在。真要让插入低于 O(n)，得换带结构共享的持久化
+  // 数据结构 —— 那会毁掉「state 是一份普通 JSON」这条，而存档往返、深比较、
+  // 序列化那几条断言全都建立在它上面。
+  //
+  // 所以上限 6 距离地板 4.0 只有 1.5 倍：**这条断言天生就紧，紧不等于该调宽。**
+  // 它红的时候要问的是「有人加了第二类超线性的活吗」，不是「6 是不是小了」。
+  //
+  // 三轮实测是 x4.84 / x4.88 / x4.95，看着像在往上漂 —— 但每轮只有一个数据点，
+  // 而「余量薄」和「其实在抛硬币」从报告上看长得一模一样。所以两个比值各测
+  // 两轮、**两轮都断言**（比原来严，不是松），报告里带上两轮的差：那是判断
+  // 「在漂」还是「在抖」唯一的依据。
+  // ======================================================================
+  ['规模比值：数据量 x4，查询与单次写入的耗时都不超过 6 倍（两轮各自断言）', () => {
     expectTrue(M.state !== null, '压测集没建起来，这条无法判定');
     const built = buildState(BIG);
     M.big = built.state;
     keepAlive.push(built.state);
     expectEq(core.counts(built.state).total, BIG, '大压测集条数');
 
-    const qSmall = best(5, () => timed(() => core.selectTodos(M.state, HOT_VIEW)));
-    const qBig = best(5, () => timed(() => core.selectTodos(M.big, HOT_VIEW)));
-    const qRatio = qBig.perOp / qSmall.perOp;
-
     const probe = { title: '规模探针' };
-    const aSmall = best(5, () => timed(() => core.addTodo(M.state, probe, { id: 'probe', now: 1 })));
-    const aBig = best(5, () => timed(() => core.addTodo(M.big, probe, { id: 'probe', now: 1 })));
-    const aRatio = aBig.perOp / aSmall.perOp;
+    const paths = [
+      { label: '查询', floor: 4.3, fn: s => core.selectTodos(s, HOT_VIEW) },
+      { label: '单次新增', floor: 4.0, fn: s => core.addTodo(s, probe, { id: 'probe', now: 1 }) }
+    ];
 
-    M.harness = { qSmall: qSmall, qBig: qBig, qRatio: qRatio, aRatio: aRatio };
     const limit = budget('scaleRatio');
-    expectTrue(qRatio <= limit, `查询耗时随规模增长超过 ${limit} 倍，像是二次`,
-      `n=${N} ${ms(qSmall.perOp)}（${qSmall.reps} 次取样）→ n=${BIG} ${ms(qBig.perOp)}（${qBig.reps} 次）= x${qRatio.toFixed(2)}\nn log n 的理论值约 4.3`);
-    expectTrue(aRatio <= limit, `单次新增耗时随规模增长超过 ${limit} 倍`,
-      `n=${N} ${ms(aSmall.perOp)} → n=${BIG} ${ms(aBig.perOp)} = x${aRatio.toFixed(2)}\n单次新增是 O(n)（查重扫一遍 + 复制一遍数组），理论值约 4`);
-    return `查询 x${qRatio.toFixed(2)}（${ms(qSmall.perOp)} → ${ms(qBig.perOp)}）｜单次新增 x${aRatio.toFixed(2)}（${ms(aSmall.perOp)} → ${ms(aBig.perOp)}）｜上限 x${limit}`;
+    const lines = [];
+    for (const p of paths) {
+      const a = ratioRound(p.fn);
+      const b = ratioRound(p.fn);
+      // 两轮都要在上限内。任意一轮超了都红 —— 挑「好看的那轮」就是在挑数据。
+      for (const [i, round] of [a, b].entries()) {
+        expectTrue(round.r <= limit, `「${p.label}」第 ${i + 1} 轮的规模比值超过 ${limit} 倍`,
+          `n=${N} ${ms(round.small.perOp)}（${round.small.reps} 次取样）→ n=${BIG} ${ms(round.big.perOp)}（${round.big.reps} 次）= x${round.r.toFixed(2)}\n` +
+          `这条路径的理论地板是 x${p.floor}。超过上限先问「是不是有人加了第二类超线性的活」，\n` +
+          '别去调宽上限 —— 上限距地板只有 1.5 倍，它天生就紧。');
+      }
+      const spread = Math.abs(a.r - b.r);
+      lines.push(`${p.label} x${a.r.toFixed(2)} / x${b.r.toFixed(2)}（两轮差 ${spread.toFixed(2)}，地板 x${p.floor}）`);
+    }
+    return `${lines.join('｜')}｜上限 x${limit}。两轮差远小于「距上限的余量」才说明是抖不是漂`;
   }],
 
   ['自证：同一套测量器套在故意二次 / 故意慢的实现上必须判红（阈值可达）', () => {
