@@ -16,11 +16,11 @@
 //
 // **而那条顺序断言带来一个自己造出来的盲区**：既然审计时必须还是草稿，这个脚本
 // 这辈子都不可能断言「已经对外可见」那个终态。原来那一段只有一句读回来打印,
-// 打印了没人解析。最后一条检查因此改成守 workflow 的结构：转正那一块里必须有
-// 一条**会返回退出码**的读回断言。见它自己的注释。
+// 打印了没人解析。最后往下数第二条检查因此改成守 workflow 的结构：转正那一块里
+// 必须有一条**会返回退出码**的读回断言。见它自己的注释。
 //
-// **最后往下数第二条是覆盖缺口的解药**：前面每条都只看「当次这个 tag」，所以旁边
-// 躺一个上一轮失败留下的空发布是完全隐形的。往外部系统写东西的审计，除了「我这次
+// **倒数第三条是覆盖缺口的解药**：前面每条都只看「当次这个 tag」，所以旁边躺一个
+// 上一轮失败留下的空发布是完全隐形的。往外部系统写东西的审计，除了「我这次
 // 写对了吗」，还要问「那个系统里现在有没有不该存在的东西」。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -37,7 +37,7 @@ const TAG = process.env.TODOX_RELEASE_TAG || '';
 // 和 verify-dist.mjs 的 PLAN、verify-release.mjs 的 EXPECT_TOTAL、release.yml 的
 // 「发布前清点资产」是一组。改一个必须重算另外三个（见 AGENTS.md）。
 // **第五处是 release.yml 转正那一块里的 `-eq 8`** —— 而那一处不用靠人记：
-// 下面最后一条检查会把它解析出来，和这里的 EXPECT_TOTAL 比。
+// 倒数第二条检查会把它解析出来，和这里的 EXPECT_TOTAL 比。
 const EXPECT_TOTAL = 8;
 const MIN_BYTES = 30 * 1024 * 1024;
 
@@ -163,7 +163,7 @@ function runBlocks(text) {
 //
 // **必须块内检查。** 全文找 `exit 1` 会被文件末尾那个无关的
 // 「闸门失败则失败 -> run: exit 1」骗过去 —— 这个仓库一天前刚为完全一样的
-// 形状红过一次（镜像令牌守卫，两个独立子串搜索，exit 1 来自别处）。
+// 形状红过一次（镜像令牌守卫：两个独立子串搜索，而 exit 1 来自别处）。
 //
 // 守四件事：
 //   1. 全仓恰好一个 run 块在做转正（两个就意味着有一条路绕过了断言）。
@@ -305,30 +305,42 @@ const CHECKS = [
   // **没人解析。日志里有答案不算断言。**
   //
   // 运行时的断言已经放进那一块（读回来、比四个字段、五次不满足就 exit 1）。
-  // 这里守的是**它还在**：删掉它一个字符都不会有任何别的东西红。
+  // 这里守的是**它还在**：删掉它，一个字符都不会有别的东西红。
+  //
+  // 时机上还有个好处：这个闸门红 -> 转正那一步的 if 不成立 -> 压根不会转正。
+  // 所以「读回断言被删掉」会在转正**之前**被拦住，而不是事后才知道。
   // ==========================================================================
   ['转正那一块里有一条会返回退出码的读回断言（块内检查 + 变异体自证）', () => {
     const rel = path.join('.github', 'workflows', 'release.yml');
     const rawWf = fs.readFileSync(path.join(ROOT, rel), 'utf8');
     expectEq(promotionGuardProblems(rawWf, EXPECT_TOTAL), [], `${rel} 转正那一块的守卫`);
 
-    // 三个变异体。第三个是正向对照：无关改动不许判红，否则这条会变成
-    // 「一改动就红」，那种红会被人学会忽略。
+    // **变异体按行号定位，不用字符串替换。** 这条是造它们的时候现学的：
+    // `exit 1` 这一行在整个文件里出现两次（令牌守卫里也有一个同样缩进的），
+    // 而 JS 的 String.replace 传字符串时**只替换第一个** —— 那会改到令牌守卫
+    // 上去，于是「变异体」压根没动要测的那一块，守卫返回空，
+    // 而我会以为是守卫失灵。**构造变异体时，说谎的往往是夹具。**
     const lines = rawWf.split('\n');
     const from = lines.findIndex(l => l.trim() === 'ok=0');
     const to = lines.findIndex(l => l.trim().startsWith("echo '终态已断言"));
-    expectTrue(from > 0 && to > from, '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
-      `ok=0 在第 ${from + 1} 行，收尾 echo 在第 ${to + 1} 行`);
+    const exitAt = lines.findIndex((l, i) => i > from && i < to && l.trim() === 'exit 1');
+    expectTrue(from > 0 && to > from && exitAt > from,
+      '在 release.yml 里定位不到读回来那一段 —— 变异体造不出来，这条自证就是空的',
+      `ok=0 第 ${from + 1} 行，收尾 echo 第 ${to + 1} 行，块内 exit 1 第 ${exitAt + 1} 行`);
 
+    const mutA = lines.slice();
+    mutA[exitAt] = ' '.repeat(12) + "echo '读回来不对，但我不失败'";
     const mutants = [
-      // A：块内那个 exit 1 换成 echo。**这是「静默跳过」的经典长相。**
-      ['A 块内 exit 1 换成 echo', rawWf.replace('\n            exit 1\n', "\n            echo '读回来不对，但我不失败'\n"), true],
-      // B：整段读回搬进注释，转正本身照做。
-      ['B 整段读回搬进注释',
-        lines.slice(0, from).concat(lines.slice(from, to + 1).map(l => `          # ${l.trim()}`), lines.slice(to + 1)).join('\n'),
-        true],
-      // C：资产数悄悄改成 7（和 EXPECT_TOTAL 漂开）。
-      ['C 资产数改成 7', rawWf.replace('"$n" -eq 8', '"$n" -eq 7'), false]
+      ['A 块内 exit 1 换成 echo（静默跳过的经典长相）', mutA.join('\n'), true],
+      ['B 整段读回搬进注释（转正照做）',
+        lines.slice(0, from)
+          .concat(lines.slice(from, to + 1).map(l => `          # ${l.trim()}`))
+          .concat(lines.slice(to + 1)).join('\n'), true],
+      // C 测的是另一件事（两处 8 各自漂开）。「全文找 exit 1」那种旧写法压根
+      // 没有这一条，所以 oldWouldPass 填 null = 不适用。**硬填一个值会让这句**
+      // **自证变成在比一件没意义的事** —— 沙箱里第一版就是这么写的，然后我
+      // 填了 false 而实际是 true，闸门会直接红在夹具上。
+      ['C 资产数悄悄改成 7', rawWf.replace('"$n" -eq 8', '"$n" -eq 7'), null]
     ];
 
     const oldBlind = [];
@@ -339,16 +351,22 @@ const CHECKS = [
       expectTrue(text.includes(PROMOTE_MARK), `变异体「${name}」把转正本身也删了 —— 那不是这条断言要抓的坏`);
       const got = promotionGuardProblems(text, EXPECT_TOTAL);
       expectTrue(got.length >= 1, `变异体「${name}」没被守卫抓到`, `守卫返回：${JSON.stringify(got)}`);
+      if (oldWouldPass === null) continue;
       // 旧写法（在**整个文件**里找 exit 1）会不会放过它 —— 把「为什么必须块内」
       // 也钉进断言，否则半年后有人图省事又改回全文搜索。
       const oldPasses = /(^|\s)exit 1(\s|$)/.test(text);
       expectEq(oldPasses, oldWouldPass, `变异体「${name}」在「全文找 exit 1」那种写法下的结果`);
-      if (oldPasses && oldWouldPass) oldBlind.push(name);
+      if (oldPasses) oldBlind.push(name);
     }
     expectEq(oldBlind.length, 2, '能从「全文找 exit 1」眼皮底下走过去的变异体个数');
 
-    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1，资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致｜` +
-      `3 个变异体全被抓到，其中 2 个能骗过「全文找 exit 1」的写法`;
+    // 夹具的反面：A 只许动一行，而且令牌守卫那个 exit 1 必须还在。
+    // 少了这两句，上面那条「按行号定位」的教训就只是注释，没有断言在守。
+    expectEq(mutA.filter((l, i) => l !== lines[i]).length, 1, 'A 改动的行数');
+    expectTrue(mutA.join('\n').includes('未配置 MIRROR_TOKEN'), 'A 不该动到令牌守卫那一段');
+
+    return `转正那一块读回了 isDraft / isLatest / 资产数，块内有 exit 1（第 ${exitAt + 1} 行），` +
+      `资产数 ${EXPECT_TOTAL} 与 EXPECT_TOTAL 一致｜3 个变异体全被抓到，其中 2 个能骗过「全文找 exit 1」的写法`;
   }],
 
   ['自检：本次实际执行的检查数等于清单数', () => {
