@@ -9,7 +9,7 @@ on:
     branches: ['release/**']
   workflow_dispatch:
 
-# 发布不许被后一次推送掐掉：掐一半会留下一个只有部分资产的 Release，
+# 发布不许被后一次推送提掉：插一半会留下一个只有部分资产的 Release，
 # 而那玩意在面板上是绿的。
 concurrency:
   group: release-${{ github.ref }}
@@ -131,7 +131,7 @@ jobs:
             回写在[构建那次提交的评论](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})里。
 
   # 发布那步退出码为 0 证明不了用户下载得到东西。这个 job 把 Release 从 API
-  # 读回来数资产 —— 正向痕迹。它挂 if: always()，所以上游炸了它也会跑，
+  # 读回来数资产 —— 正向痕迹。它挂 if: always()，所以上游灸了它也会跑，
   # 然后如实报「读不到 Release」，而不是静默跳过。
   verify:
     name: 发布资产校验闸门
@@ -227,7 +227,7 @@ jobs:
           echo "准备同步 $n 个文件到 $MIRROR $TAG"
           test "$n" -eq 8
           find installers -type f -printf '  %f  %s 字节\n'
-          notes=$(printf 'TodoX %s — 跨平台桌面待办事项应用。\n\n| 平台 | 下载 |\n| --- | --- |\n| Windows | `TodoX Setup *.exe`（安装版）或 `*-win.zip`（免安装） |\n| macOS | `*-arm64.dmg`（Apple 芯片）或 `*-x64.dmg`（Intel） |\n| Linux | `*.AppImage`（`chmod +x` 后直接跑）或 `*.deb` |\n\n**安装包没有签名。** macOS 会提示无法验证开发者，到「系统设置 → 隐私与安全性」点「仍要打开」；Windows SmartScreen 会拦一次，点「更多信息」→「仍要运行」。\n' "$TAG")
+          notes=$(printf 'TodoX %s — 跳平台桌面待办事项应用。\n\n| 平台 | 下载 |\n| --- | --- |\n| Windows | `TodoX Setup *.exe`（安装版）或 `*-win.zip`（免安装） |\n| macOS | `*-arm64.dmg`（Apple 芯片）或 `*-x64.dmg`（Intel） |\n| Linux | `*.AppImage`（`chmod +x` 后直接跑）或 `*.deb` |\n\n**安装包没有签名。** macOS 会提示无法验证开发者，到「系统设置 → 隐私与安全性」点「仍要打开」；Windows SmartScreen 会拦一次，点「更多信息」→「仍要运行」。\n' "$TAG")
           if gh release view "$TAG" --repo "$MIRROR" >/dev/null 2>&1; then
             echo "$TAG 已存在，退回草稿并清空旧资产后重传"
             gh release edit "$TAG" --repo "$MIRROR" --draft=true --prerelease=false --notes "$notes"
@@ -310,9 +310,17 @@ jobs:
         run: exit 1
 
   # 回写走的是和 verify.yml 同一份共享 workflow，只是换了 composer 入口和 marker。
-  # **钉在 SHA 上，不许 @main**：那是可变引用，上游改一行就会悄悄改掉这四条
-  # 流水线的行为，而回写坏掉的表现是「闸门全绿但没人看得到结论」。快闸门断言
-  # 四份 workflow 钉的 SHA 集合大小恰好为 1 —— 只更新一半也要红。
+  # **跟随上游 `@main`。2026-08-16 从钉 SHA 改过来的。**
+  #
+  # 这里原来写着「不许 @main」，而那个担心（上游改一行就悄悄改掉这四条流水线
+  # 的行为，而回写坏掉的表现是「闸门全绿但没人看得到结论」）**本身没错**。
+  # 错的是它漏了一个消费者：flappycat 从建立起就用着 @main，而本仓那条
+  # 「四份只能钉同一个 SHA」的断言只扫本仓，看不见它。
+  #
+  # 快闸门现在断言四份 workflow **跟的引用集合大小恰好为 1**（只改一半也要红 ——
+  # 那一条一字未改，变的只是它数的东西不再叫 SHA），而且必须恰好是 `main`、
+  # 不许是 40 位 SHA。跟随主干的代价落在仓外（一条 30 天期限 + Quinn 每天读上游），
+  # 详见 verify.yml 里那段。
   summary:
     name: 回报结果
     if: always()
@@ -320,7 +328,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
     with:
       node-version: '20'
       gates: '[{"name":"安装包闸门","result":"${{ needs.dist.result }}"},{"name":"发布 Release","result":"${{ needs.publish.result }}"},{"name":"发布资产校验闸门","result":"${{ needs.verify.result }}"},{"name":"公开仓 Release 同步","result":"${{ needs.mirror.result }}"}]'
