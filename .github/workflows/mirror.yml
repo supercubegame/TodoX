@@ -116,7 +116,10 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: exit 1
 
-  # 回写钉在 SHA 上，不许 @main。四份 workflow 只能钉同一个，快闸门有断言在守。
+  # 回写**跟随上游 main**（2026-08-16 从钉 SHA 改过来）。四份 workflow 只能跟同一个
+  # 引用，快闸门有断言在守 —— 那一条一字未改，它防的从来不是钉没钉，而是
+  # 只改了一半。跟随主干的代价（上游改一行这边不会红）落在仓外：
+  # clickup-brain-backup 那条 30 天期限，加上 Quinn 每天读回上游主干。详见 verify.yml。
   summary:
     name: 回报镜像结果
     if: always()
@@ -124,7 +127,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
     with:
       node-version: '20'
       gates: '[{"name":"公开镜像同步","result":"${{ needs.sync.result }}"}]'
