@@ -707,7 +707,8 @@ const CHECKS = [
       '把真实调用注释掉之后仍然没判红 —— 那这条还是装饰',
       '这正是旧版的行为：它在没剥注释的原文上找关键词，而注释里那几个词照样命中。');
 
-    const commented = raw.replace('    resizable: true,', '    // 别写成 resizable: false\n    resizable: true,');
+    const commented = raw.replace('    resizable: true,', '    // 别写成 resizable: false
+    resizable: true,');
     expectTrue(commented !== raw, '构造注释变异体时没替换到任何东西 —— 夹具坏了');
     expectTrue(!stripComments(commented).includes('resizable: false'),
       '注释里提到 resizable: false 被误判成违规 —— 剥注释没起作用');
@@ -767,7 +768,9 @@ const CHECKS = [
     expectTrue(
       (typeof email === 'string' && email.includes('@')) || (typeof maintainer === 'string' && maintainer.includes('@')),
       'deb 目标缺少 maintainer',
-      `author=${JSON.stringify(author)}\nlinux.maintainer=${JSON.stringify(maintainer)}\n` +
+      `author=${JSON.stringify(author)}
+linux.maintainer=${JSON.stringify(maintainer)}
+` +
       "electron-builder 会报 Please specify author 'email' in the application package.json，" +
       '而 AppImage 那一半照样成功 —— 所以症状是「Linux 只出了 1 个产物」，不是「构建全挂」。'
     );
@@ -776,12 +779,15 @@ const CHECKS = [
 
   ['文档：AGENTS.md ≤ 200 行，两节已挪进 PITFALLS 且没有留副本', () => {
     const agents = readIfExists('AGENTS.md');
-    const n = agents.split('\n').length;
+    const n = agents.split('
+').length;
     expectTrue(n <= 200, `AGENTS.md ${n} 行，超过 200 行上限`,
-      '写长了模型会开始忽略里面的指令。这条上限只有断言守得住，写在文件里没用。\n' +
+      '写长了模型会开始忽略里面的指令。这条上限只有断言守得住，写在文件里没用。
+' +
       '正确反应是压措辞或者把增长最快的那节挪去 docs/PITFALLS.md,**不是调宽上限**。');
     const pit = readIfExists('docs/PITFALLS.md');
-    const pitLines = pit.split('\n').length;
+    const pitLines = pit.split('
+').length;
     expectTrue(pitLines >= 40, `docs/PITFALLS.md 只有 ${pitLines} 行，像是没真的搬过去`, pit.slice(0, 300));
     expectTrue(agents.includes('docs/PITFALLS.md'), 'AGENTS.md 里没有引用 docs/PITFALLS.md',
       '拆出去而不留指路牌，等于把那份档案藏起来了。');
@@ -909,217 +915,4 @@ const CHECKS = [
     for (const [name, j] of jobs) {
       const ifs = jobLevelIfs(j);
       if (ALWAYS.includes(name)) {
-        if (!ifs.some(l => /^if:\s*always\(\)$/.test(l))) problems.push(`${name} 应该带 if: always()，实际：${ifs.join(' / ') || '（没有任何 if）'}`);
-      } else if (ifs.length > 0) {
-        problems.push(`${name} 不该有 job 级 if，实际：${ifs.join(' / ')}`);
-      }
-    }
-    expectEq(problems, [], 'job 条件的问题');
-    const plain = [...jobs.keys()].filter(n => !ALWAYS.includes(n));
-    return `${jobs.size} 个 job：${plain.join(' / ')} 无条件执行，${ALWAYS.join(' / ')} 带 always() —— 新加 job 会自动落进这条断言`;
-  }],
-
-  ['CI：verify 有回写送达核对 job，marker 两处一致且不占用报告命名空间', () => {
-    const text = bare('verify');
-    const jobs = jobBlocks(text);
-    const j = jobs.get('attest');
-    expectTrue(Boolean(j), 'verify.yml 里没有 attest job —— 回写坏掉时没有任何东西在喊', [...jobs.keys()].join(','));
-    const needs = needsOf(j);
-    expectTrue(needs !== null && needs.includes('summary'), 'attest 必须 needs summary —— 评论还没写就去找它，等的是时序不是真相', j.text.slice(0, 300));
-    expectTrue(j.text.includes('scripts/attest-comment.mjs'), 'attest job 没有真的执行核对脚本', j.text.slice(0, 400));
-    const summaryNeeds = needsOf(jobs.get('summary')) || [];
-    expectTrue(!summaryNeeds.includes('attest'), 'summary 的 needs 里出现了 attest —— 那是个环', summaryNeeds.join(','));
-    const markerLine = /marker:\s*'([^']+)'/.exec(jobs.get('summary').text);
-    expectTrue(Boolean(markerLine), '扫不到 summary 的 marker —— 是扫描器坏了，不是配置对了', jobs.get('summary').text.slice(0, 400));
-    const script = readIfExists('scripts/attest-comment.mjs');
-    expectTrue(script.includes(`'${markerLine[1]}'`), 'attest 脚本里的 marker 与 workflow 不一致',
-      `workflow: ${markerLine[1]}\n核对脚本里找不到这个字面量。两处必须逐字相同。`);
-    expectTrue(!tokenSet('verify', RE_STDOUT).has('attest'), 'attest 的日志占用了 stdout-<slug>.log 命名空间（那个集合由 GATES 定义）');
-    expectTrue(!tokenSet('verify', RE_REPORT).has('report-attest'), 'attest 的产物占用了 report-* 命名空间（同上）');
-    expectTrue(j.text.includes('attest.log'), 'attest 没有把输出 tee 成日志 —— 失败时读不到原因');
-    expectTrue(MANIFEST.attest > 0, 'manifest 里没有登记 attest 的条数', JSON.stringify(MANIFEST));
-    return `attest needs [${needs.join(',')}]，执行 attest-comment.mjs（${MANIFEST.attest} 条核对），marker ${markerLine[1]} 两处一致，未占用 report-* / stdout-*`;
-  }],
-
-  ['CI：release 只在 release/** 上触发，而 verify 覆盖所有分支（双向）', () => {
-    const on = onBlock(wf('release'));
-    expectTrue(on.length > 0, 'release.yml 里解析不到 on: 块 —— 是扫描器坏了，不是配置对了', wf('release').slice(0, 300));
-    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
-    expectEq(branches, ["branches: ['release/**']"], 'release.yml 的分支过滤');
-    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'release.yml 没有手动触发的口子', on.join('\n'));
-    expectTrue(!on.some(l => /pull_request|schedule/.test(l)), 'release.yml 挂上了不该挂的事件', on.join('\n'));
-    const vb = onBlock(wf('verify')).filter(l => l.includes('branches:')).map(l => l.trim());
-    expectEq(vb, ["branches: ['**']"], 'verify.yml 的分支过滤');
-    return "release 只认 release/**（不挂 main，不挂 **），verify 仍覆盖 ** —— 该跑不跑要红，不该跑却跑了也要红";
-  }],
-
-  ['CI：screenshots 的触发范围与回写循环守卫（身份判断，不是提交信息字符串）', () => {
-    const text = bare('screenshots');
-    const on = onBlock(wf('screenshots'));
-    expectTrue(on.length > 0, 'screenshots.yml 里解析不到 on: 块 —— 扫描器坏了', wf('screenshots').slice(0, 300));
-    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
-    expectEq(branches, ["branches: ['docs/**', 'shots/**']"], 'screenshots.yml 的分支过滤');
-    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'screenshots.yml 没有手动触发的口子', on.join('\n'));
-    const jobs = jobBlocks(text);
-    expectTrue(jobs.has('shots'), 'screenshots.yml 里没有 shots job', [...jobs.keys()].join(','));
-    const j = jobs.get('shots');
-    expectEq(jobLevelIfs(j), [], 'shots job 上的 job 级 if');
-    expectTrue(j.text.includes('contents: write'), 'shots job 没有 contents: write，回写会直接失败', j.text.slice(0, 400));
-    const configured = /git config user\.email '([^']+)'/.exec(text);
-    expectTrue(Boolean(configured), '扫不到回写步骤里配置的 committer 邮箱 —— 是扫描器坏了，不是配置对了', j.text.slice(0, 600));
-    const email = configured[1];
-    expectTrue(email.includes('@'), '回写配置的 committer 邮箱不是邮箱形状', email);
-    const guard = new RegExp(`head_commit\.committer\.email\s*!=\s*'${reEscape(email)}'`);
-    expectTrue(guard.test(text), '回写守卫比较的邮箱与 git config 配的那个不一致',
-      `git config 配的是 ${email}\n两处必须逐字相同，否则守卫会哑 —— 而哑掉的表现是自触发循环，不是红。`);
-    expectTrue(text.includes("github.actor != 'github-actions[bot]'"), '缺第二层 actor 守卫', j.text.slice(0, 800));
-    expectTrue(text.includes("steps.gate.outcome == 'success'"), '回写没有挂在截图闸门的结果上 —— 闸门红的时候会把黑图钉进仓库', j.text.slice(0, 800));
-    const SKIP_MARK = ['[skip', ' ci]'].join('');
-    expectTrue(!text.includes(SKIP_MARK), '那个提交信息里的跳过标记回来了',
-      '留着它身份守卫永远走不到，于是没法区分「它在守」和「它是空的」。守卫已经改成身份判断，字符串那条要删干净。');
-    return `只认 docs/** 与 shots/**，job 无条件执行；守卫 = 闸门绿 + committer 不是 ${email} + actor 不是 bot（两处邮箱逐字相同），字符串守卫已删净`;
-  }],
-
-  ['CI：screenshots 的产物名与 stdout 日志集合等于 SHOTS_GATES', () => {
-    const names = tokenSet('screenshots', RE_REPORT);
-    const wantNames = new Set(SHOTS_GATES.map(g => `report-${g.slug}`));
-    expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
-    const slugs = tokenSet('screenshots', RE_STDOUT);
-    const wantSlugs = new Set(SHOTS_GATES.map(g => g.slug));
-    expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
-    return `${names.size} 个产物 + ${slugs.size} 条日志，与 SHOTS_GATES 完全相等`;
-  }],
-
-  ['CI：mirror 的触发范围、令牌守卫（块内断言 + 变异体自证）与源 SHA 痕迹', () => {
-    const text = wf('mirror');
-    const on = onBlock(text);
-    expectTrue(on.length > 0, 'mirror.yml 里解析不到 on: 块 —— 扫描器坏了', text.slice(0, 300));
-    const branches = on.filter(l => l.includes('branches:')).map(l => l.trim());
-    expectEq(branches, ['branches: [main]'], 'mirror.yml 的分支过滤');
-    expectTrue(on.some(l => l.trim() === 'workflow_dispatch:'), 'mirror.yml 没有手动触发的口子', on.join('\n'));
-    const jobs = jobBlocks(text);
-    expectTrue(jobs.has('sync'), 'mirror.yml 里没有 sync job', [...jobs.keys()].join(','));
-    expectEq(jobLevelIfs(jobs.get('sync')), [], 'sync job 上的 job 级 if');
-
-    const guardBlocks = blocksContaining(text, 'MIRROR_TOKEN:-');
-    expectEq(guardBlocks.length, 1, '含 ${MIRROR_TOKEN:-} 的 run 块个数（0 说明守卫没了，多个说明有重复实现）');
-    expectTrue(/(^|\n)\s*exit 1\b/.test(guardBlocks[0].code),
-      `mirror.yml 第 ${guardBlocks[0].line} 行那个令牌守卫块里没有 exit 1`,
-      '令牌缺失时必须让整个 job 红。静默跳过就等于「以为同步了，其实什么都没发生」，\n' +
-      '而那和「同步成功」在面板上长得一模一样。\n' +
-      '注意：文件别处的 exit 1（比如末尾那个「闸门失败则失败」步骤）不算 —— \n' +
-      '这条断言的前一版就是被那个字面量满足的，实测两个变异体都活了下来。');
-
-    const shaBlocks = blocksContaining(text, '${GITHUB_SHA:0:7}');
-    expectTrue(shaBlocks.length >= 1, '同步的提交信息里没有源 SHA',
-      '那是审计唯一能区分「同步成功」与「镜像早就停在旧内容上」的凭据');
-    expectTrue(shaBlocks.some(b => b.code.includes('git commit')), '源 SHA 不在真的建提交的那个块里',
-      '写在别处（比如一句 echo）的话，公开仓那边的提交信息里其实没有它');
-
-    expectTrue(text.includes('git push --force'), 'mirror.yml 不是强推 —— 公开仓可能留下私有历史', text.slice(0, 400));
-
-    const guardCheck = t => {
-      const bs = blocksContaining(t, 'MIRROR_TOKEN:-');
-      return bs.length === 1 && /(^|\n)\s*exit 1\b/.test(bs[0].code);
-    };
-    expectTrue(guardCheck(text), '检查器在真文本上应该通过 —— 否则下面两个变异体的判红没有意义');
-    const silent = text.replace(/(\n\s*)exit 1(\n\s*fi)/, "$1echo '没令牌，跳过同步'$2");
-    expectTrue(silent !== text, '构造「静默跳过」变异体时没替换到任何东西 —— 夹具坏了，不是产品对了');
-    expectTrue(!guardCheck(silent), '把守卫里的 exit 1 换成 echo 之后检查器居然没判红 —— 那这条还是装饰',
-      '静默跳过是这条断言唯一要防的东西');
-    const noGuard = text.split('\n').filter(l => !l.includes('MIRROR_TOKEN:-')).join('\n');
-    expectTrue(!guardCheck(noGuard), '守卫整个删掉之后检查器没判红');
-
-    const names = tokenSet('mirror', RE_REPORT);
-    expectEq([...names].sort(), MIRROR_GATES.map(g => `report-${g.slug}`).sort(), '产物名集合');
-    const slugs = tokenSet('mirror', RE_STDOUT);
-    expectEq([...slugs].sort(), MIRROR_GATES.map(g => g.slug).sort(), 'stdout 日志 slug 集合');
-    return `只认 main；令牌守卫在第 ${guardBlocks[0].line} 行那个块内部真的有 exit 1（两个变异体都被抓住：` +
-      `换成静默跳过、整块删掉）；源 SHA 在 git commit 的那个块里；强推在；产物名与 MIRROR_GATES 相等`;
-  }],
-
-  ['CI：release 的三平台 matrix 与 RELEASE_GATES 的 dist-* 一一对应', () => {
-    const slugs = matrixSlugs(bare('release')).slice().sort();
-    const want = RELEASE_GATES.map(g => g.slug).filter(s => s.startsWith('dist-')).sort();
-    expectEq(slugs, want, 'matrix slug 集合');
-    const oses = [...bare('release').matchAll(/^\s*- os:\s*([^\s]+)\s*$/gm)].map(m => m[1]);
-    expectEq(oses.length, 3, 'runner 数量');
-    expectEq(new Set(oses).size, 3, '互不相同的 runner 数量');
-    return `${slugs.join(' / ')} 跑在 ${oses.join(' / ')} 上 —— 少一个平台就红，不是「至少三个」`;
-  }],
-
-  ['CI：release 的产物名与 stdout 日志集合都等于 RELEASE_GATES', () => {
-    const names = tokenSet('release', RE_REPORT);
-    const wantNames = new Set(RELEASE_GATES.map(g => `report-${g.slug}`));
-    expectEq([...names].sort(), [...wantNames].sort(), '产物名集合');
-    const slugs = tokenSet('release', RE_STDOUT);
-    const wantSlugs = new Set(RELEASE_GATES.map(g => g.slug));
-    expectEq([...slugs].sort(), [...wantSlugs].sort(), 'stdout 日志 slug 集合');
-    return `${names.size} 个产物 + ${slugs.size} 条日志，与 RELEASE_GATES 完全相等`;
-  }],
-
-  ['CI：release 的每个 job 要么无条件执行，要么显式 always()（枚举即期望）', () => {
-    const jobs = jobBlocks(bare('release'));
-    expectTrue(jobs.size >= 5, 'release.yml 的 job 数量少于预期 —— 是扫描器坏了，不是配置对了', [...jobs.keys()].join(','));
-    const ALWAYS = ['verify', 'summary'];
-    for (const n of ALWAYS) expectTrue(jobs.has(n), `release.yml 里没有 ${n} job`, [...jobs.keys()].join(','));
-    const problems = [];
-    for (const [name, j] of jobs) {
-      const ifs = jobLevelIfs(j);
-      if (ALWAYS.includes(name)) {
-        if (!ifs.some(l => /^if:\s*always\(\)$/.test(l))) problems.push(`${name} 应该带 if: always()，实际：${ifs.join(' / ') || '（没有任何 if）'}`);
-      } else if (ifs.length > 0) {
-        problems.push(`${name} 不该有 job 级 if，实际：${ifs.join(' / ')}`);
-      }
-    }
-    expectEq(problems, [], 'job 条件的问题');
-    const plain = [...jobs.keys()].filter(n => !ALWAYS.includes(n));
-    return `${jobs.size} 个 job：${plain.join(' / ')} 无条件执行，${ALWAYS.join(' / ')} 带 always() —— 新加 job 会自动落进这条断言`;
-  }],
-
-  ['密钥：哨兵在源码与报告里出现 0 次（负向）', () => {
-    const files = walk(ROOT).filter(isTextFile);
-    const hits = files.filter(f => {
-      try { return fs.readFileSync(f, 'utf8').includes(SENTINEL); } catch { return false; }
-    }).map(f => path.relative(ROOT, f));
-    expectEq(hits, [], '哨兵泄漏的文件');
-    const inReport = JSON.stringify(report.toJSON()).includes(SENTINEL);
-    expectTrue(!inReport, '哨兵密钥泄漏进了报告本体', '报告会被原样贴到 PR 评论里');
-    return `哨兵（每次运行随机生成）在 ${files.length} 个文本文件与报告 JSON 中出现 0 次`;
-  }],
-
-  ['密钥：仓库里没有密钥形状的字面量', () => {
-    const patterns = [
-      ['GitHub token', new RegExp(['gh', 'p_[A-Za-z0-9]{20,}'].join(''))],
-      ['AWS key', new RegExp(['AK', 'IA[0-9A-Z]{16}'].join(''))],
-      ['私钥块', new RegExp(['-----BEGIN', ' [A-Z ]*PRIVATE KEY-----'].join(''))],
-      ['Slack token', new RegExp(['xox', '[abpr]-[A-Za-z0-9-]{12,}'].join(''))]
-    ];
-    const hits = [];
-    let scanned = 0;
-    for (const f of walk(ROOT).filter(isTextFile)) {
-      let text = '';
-      try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
-      scanned += 1;
-      for (const [name, re] of patterns) if (re.test(text)) hits.push(`${path.relative(ROOT, f)}: ${name}`);
-    }
-    expectEq(hits, [], '密钥形状的字面量');
-    return `${scanned} 个文本文件、4 类密钥形状全部 0 命中（模式由拼接构造，扫描不会抓到自己）`;
-  }],
-
-  ['自检：标题唯一 + 实际检查数等于清单数', () => {
-    const titles = report.checks.map(c => c.title);
-    const dup = titles.filter((t, i) => titles.indexOf(t) !== i);
-    expectEq(dup, [], '重复的检查标题');
-    const actual = report.checks.length + 1;
-    expectEq(actual, CHECKS.length, '本次实际执行的检查数');
-    expectEq(CHECKS.length, MANIFEST.fast, 'scripts/manifest.json 里登记的条数');
-    return `${actual} 条检查全部执行，等号断言（不是下限，下限会自己漂）`;
-  }]
-];
-
-for (const [title, fn] of CHECKS) report.check(title, fn);
-
-report.save(ARTIFACTS, 'fast');
-process.stdout.write(`\n共执行 ${report.total} 条检查，通过 ${report.passed}，失败 ${report.failed}\n`);
-process.exit(report.ok ? 0 : 1);
+        if (!ifs.some(l => /^if:")
