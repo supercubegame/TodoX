@@ -163,12 +163,25 @@ jobs:
   # 回写不在这里。它是 supercubegame/ci-workflows 里的一份文件，image-grabber
   # 和 jumpwow 用的是同一份，另外三条流水线也用同一份。
   #
-  # **钉在 SHA 上，不许 @main。** 那是一个可变的引用：上游改一行就会悄悄改掉
-  # 这四条流水线的行为，而回写坏掉的表现是「闸门全绿但没人看得到结论」——
-  # 已知最安静的一种失效。快闸门断言这里必须是 40 位 SHA，而且四份 workflow
-  # 只能钉同一个（只更新一半也要红）。
+  # **跟随上游 `@main`。2026-08-16 从钉 SHA 改过来的，而代价写在下面，不藏。**
   #
-  # 上游有值得跟的改动时，手动 bump 这个 SHA 并读一遍 diff。这是有意的摩擦。
+  # 这里原来写着「不许 @main」，理由是可变引用会让上游改一行就悄悄改掉这四条
+  # 流水线的行为。**那担心本身没错，错的是它漏了一个消费者。** 上游那份文件自己
+  # 的文件头写着「两边都固定用 @main」，理由是防多个消费者停在不同 SHA 上；
+  # 而 supercubegame/flappycat 从建立起就用着 @main。也就是说「两套策略并存」
+  # 这件事已经发生了，而本仓那条「四份只能钉同一个 SHA」的断言**只扫本仓**，
+  # 它看不见那个已经分叉的消费者。
+  #
+  # **跟随 main 的代价是真的：上游改一行，这边行为跟着变，而闸门不会红。**
+  # 那个风险本地断言覆盖不了，所以它的落点在仓外：
+  #   1. clickup-brain-backup 的 manifest.writeback.upstream_read_at 有 30 天期限，
+  #      过期就红 —— 逼人真的去读一遍远端 main 并更新归档拷贝。
+  #   2. 「闸门审计 Quinn」每天读回上游主干，变了就报。
+  # **一个不能被本地断言覆盖的风险，落点只能是外部观察者加一条带期限的义务。**
+  #
+  # 快闸门现在断言：这里必须恰好是 `@main`，**而且不许是 40 位 SHA**（防有人
+  # 偷偷把某一处钉回去 —— 那正是上游担心的那个形状），而「四份跟同一个引用」
+  # 那一条**一字未改**：它防的从来不是钉没钉，而是只改了一半。
   #
   # 那个 job 里每一条不寻常的设计（不 checkout、兜底评论前置、取脚本和回写都
   # 带重试、降级报告自己说明自己是降级的）都写在那份文件的头部注释里。
@@ -184,7 +197,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
     with:
       node-version: '20'
       gates: '[{"name":"快闸门","result":"${{ needs.fast.result }}"},{"name":"Electron 端到端闸门","result":"${{ needs.e2e.result }}"},{"name":"性能压测闸门","result":"${{ needs.perf.result }}"},{"name":"三平台打包闸门","result":"${{ needs.pack.result }}"}]'
@@ -193,7 +206,8 @@ jobs:
       marker: '<!-- todox-verify -->'
 
   # ==========================================================================
-  # 事后核对。钉住 SHA 只解决「上游悄悄变了」,不解决「这一次到底送出去了没有」。
+  # 事后核对。跟随主干只解决「多个消费者不要停在不同版本上」,不解决
+  # 「这一次到底送出去了没有」。
   #
   # 这个 job 回头去 API 上找那条带 marker 的评论，并且把结论钉在**本次运行**上
   # （正文里必须含本次短 SHA 与 run id）。「存在一条带 marker 的评论」是幂等
