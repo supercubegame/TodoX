@@ -34,8 +34,8 @@ jobs:
       # 全是方块。
       #
       # 守这一行的**不是**一条静态断言（那只能证明配置文件里有这行字），而是
-      # shoot.mjs 里那条字形断言：它拿 U+E000 当豆腐块基准，真的去比中文字形的
-      # 位图签名。字体没装上，它就红。
+      # shoot.mjs 里那条字形断言：它拿 U+E000 当豆腐块基准，真的去比中文字形的位图
+      # 签名。字体没装上，它就红。
       - name: 装系统依赖与中日韩字体
         run: |
           sudo apt-get update
@@ -131,7 +131,8 @@ jobs:
   # 于 CI 日志里 —— 而那是 agent 读不到的地方。从外面看，「跑了但没产出截图」
   # 和「压根没跑」长得一模一样。送不出结论的闸门等于没跑。
   #
-  # 回写钉在 SHA 上，不许 @main。四份 workflow 只能钉同一个，快闸门有断言在守。
+  # 回写**跟随上游 main**（2026-08-16 从钉 SHA 改过来）。四份 workflow 只能跟同一个
+  # 引用，快闸门有断言在守，而那一条一字未改。代价与它的落点详见 verify.yml。
   summary:
     name: 回报截图结果
     if: always()
@@ -139,7 +140,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: supercubegame/ci-workflows/.github/workflows/report.yml@f0fccd3ff41e6864088bd26d90a163e662982c83
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
     with:
       node-version: '20'
       gates: '[{"name":"截图生成器","result":"${{ needs.shots.result }}"}]'
