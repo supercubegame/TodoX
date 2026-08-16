@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 快闸门：零依赖，几十秒出结果。断言纯核心的真实行为 + 一批静态不变量 +
-// CI 配置自审（假绿、沉默通道、清单漂移、触发策略、回写钉住）。
+// CI 配置自审（假绿、沉默通道、清单漂移、触发策略、回写跟随主干）。
 //
 // 每一条断言都问过同一个问题：如果这个功能完全没实现，这条会不会失败？
 // 不会失败的就是空断言，不许留在这里。
@@ -28,18 +28,16 @@ import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
 import { Report, GATES, RELEASE_GATES, SHOTS_GATES, MIRROR_GATES } from './lib/report.mjs';
 import { SHOTS, SHOT_DIR, MIN_BYTES } from './lib/shots.mjs';
+import { writebackRefProblems, pinGuardSelfProof, SAMPLE_COUNT as PIN_GUARD_SAMPLES } from './lib/pin-guard.mjs';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'manifest.json'), 'utf8'));
 
-// 哨兵密钥：每次运行随机生成。写死一个密钥形状的字面量会被下面那条扫描抓到，
-// 而那时说谎的是夹具不是扫描。
 const SENTINEL = 'todox-sentinel-' + crypto.randomBytes(16).toString('hex');
 process.env.TODOX_SENTINEL_SECRET = SENTINEL;
 
-// ---------------------------------------------------------------- 断言小工具
 function fail(msg, evidence) {
   const e = new Error(msg);
   if (evidence != null) e.evidence = typeof evidence === 'string' ? evidence : JSON.stringify(evidence, null, 2);
@@ -80,16 +78,9 @@ function walk(dir, out = []) {
   }
   return out;
 }
-// 正则转义。把从配置里读出来的字面量拼进正则之前必须过一遍，否则邮箱里的 `.`
-// 和 `+` 会变成元字符 —— 那样断言会在一个「看起来匹配了」的地方悄悄放宽。
 function reEscape(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-// 密钥扫描只看文本文件。截图进仓库之后，二进制里凑巧出现一段密钥形状的字节
-// 就会给出一条谁也看不懂的偶发红 —— 而它防的东西（把密钥藏进 PNG）不现实。
 const BINARY_EXT = ['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.zip', '.asar', '.icns'];
 function isTextFile(f) { return !BINARY_EXT.includes(path.extname(f).toLowerCase()); }
-
-// 字符级扫描器，不用正则。用正则剥注释会在字符串里出现 // 或 /* 的时候整段吃掉
-// 代码 —— 那不是「少抓几个」，是让整类输入凭空消失。
 function stripComments(src) {
   let out = '';
   let i = 0;
@@ -123,8 +114,6 @@ function stripComments(src) {
   }
   return out;
 }
-
-// HTML 注释。index.html 里也有说明文字，同一个洞。
 function stripHtmlComments(src) {
   let out = '';
   let i = 0;
@@ -139,42 +128,18 @@ function stripHtmlComments(src) {
   }
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// 读源码找关键词的断言，一律走这里,**只看会执行的代码**。
-//
-// 2026-08-14 实测：剥注释这件事这个仓库已经做对过两次（src/core 的纯度扫描、
-// workflow 的 YAML 扫描），但**没有传染到「读 main.js / preload / index.html
-// 找关键词」这一类**。同一个形状第三次出现，而这次一口气有四条断言中招：
-// 把那些关键词的真实调用全删掉、只在一句说明注释里提到它们，四条全都照样绿。
-//
-// 反过来那一侧也错：负向断言「不许出现 resizable: false」会被一句
-// 「注意：绝对不要写成 resizable: false」的注释误报成红。剥注释同时修好两侧。
-//
-// **模板级的修复不会自己传染。** 修好一处之后要主动去找同一个形状的其它地方,
-// 这已经是这条经验在本仓库的第四次应验（前三次：workflow 登记表、job 条件
-// 名单、截图产物名对齐）。
-// ---------------------------------------------------------------------------
 const CODE_CACHE = new Map();
 function codeOf(rel) {
   if (CODE_CACHE.has(rel)) return CODE_CACHE.get(rel);
   const raw = readIfExists(rel);
   const ext = path.extname(rel).toLowerCase();
   const stripped = ext === '.html' ? stripHtmlComments(raw) : stripComments(raw);
-  // 解析式断言先证明解析成功：剥成空字符串的话，后面每条「里面有没有 X」
-  // 都会变成「没有」—— 那是假红，而假红会让人去改产品迁就尺子。
-  expectTrue(stripped.trim().length > 0, `剥注释后 ${rel} 空了 —— 扫描器坏了`,
-    `原文 ${raw.length} 字节`);
-  expectTrue(stripped.length > raw.length * 0.3, `剥注释把 ${rel} 剥掉了太多`,
-    `${raw.length} -> ${stripped.length} 字节`);
+  expectTrue(stripped.trim().length > 0, `剥注释后 ${rel} 空了 —— 扫描器坏了`, `原文 ${raw.length} 字节`);
+  expectTrue(stripped.length > raw.length * 0.3, `剥注释把 ${rel} 剥掉了太多`, `${raw.length} -> ${stripped.length} 字节`);
   CODE_CACHE.set(rel, stripped);
   return stripped;
 }
-
-// 让四条源码断言共用一个「关键词都在」的检查器，好让变异体自证证的是真货。
 function missingNeedles(code, needles) { return needles.filter(s => !code.includes(s)); }
-
-// ---------------------------------------------------------------- 核心与夹具
 let core = null;
 function getCore() {
   if (!core) core = require(path.join(ROOT, 'src', 'core', 'store.js'));
@@ -195,16 +160,6 @@ function sample() {
   s = c.addTodo(s, { title: 'Apple 派', notes: '', priority: 'low' }, { id: 'c', now: 300 });
   return s;
 }
-
-// ---------------------------------------------------------------- workflow 扫描器
-// 每个函数都吃 text 参数：四条流水线共用同一套扫描器。以前只扫 verify.yml，
-// 那样 release.yml 可以自由地长出一个没有 pipefail 的 tee 而没人看得见 ——
-// 模板级的修复不会自己跨文件传染。
-//
-// 这张表是手写的，那就是漏继承的下一个藏身处：再加一份 workflow 而忘了登记，
-// 它就完全在扫描范围之外，可以自由长出假绿。所以下面有一条断言让**目录本身
-// 成为期望**：实际存在的文件集合必须等于这张表。实测有效 —— 加 mirror.yml 那次
-// 就是它当场抓住的。
 const WF = {
   verify: { path: '.github/workflows/verify.yml', text: null, bare: null },
   release: { path: '.github/workflows/release.yml', text: null, bare: null },
@@ -215,29 +170,6 @@ function wf(key) {
   if (WF[key].text == null) WF[key].text = readIfExists(WF[key].path);
   return WF[key].text;
 }
-// 剥掉注释的那份，给「集合相等」和「配置里有没有 X」类断言用。
-// **剥完先自证**：剥成空字符串的话，后面每条集合断言都会免费通过（空集合等于空集合）。
-function bare(key) {
-  if (WF[key].bare == null) {
-    const stripped = stripYamlComments(wf(key));
-    for (const need of ['jobs:', 'runs-on:', 'uses:']) {
-      expectTrue(stripped.includes(need), `剥注释后 ${WF[key].path} 里连 ${need} 都没了`,
-        `原文 ${wf(key).length} 字节 -> 剥后 ${stripped.length} 字节，扫描器坏了`);
-    }
-    const lines = stripped.split('\n').filter(l => l.trim() !== '').length;
-    expectTrue(lines >= 20, `剥注释后 ${WF[key].path} 只剩 ${lines} 行非空内容，扫描器坏了`);
-    WF[key].bare = stripped;
-  }
-  return WF[key].bare;
-}
-
-// YAML 版的剥注释。实测踩过：workflow 里一句说明注释里写着 stdout-<slug>.log，
-// 于是「日志名集合等于 GATES」那条断言的实际集合里多出一个字面量 <slug>——
-// 和纯度扫描第一次被自己的「别往里塞 Date.now()」注释抓到，是同一个形状。
-// **扫描器该先剥注释**，而不是反过来去改注释迁就扫描器（那是拿产品迁就尺子）。
-//
-// 引号感知，而且只把「行首或前面是空白」的 # 当注释起点 —— YAML 本身就是
-// 这个规矩，URL 片段和 foo#bar 这类写法不该被切掉。
 function stripYamlComments(text) {
   return text.split('\n').map(line => {
     let out = '';
@@ -252,7 +184,18 @@ function stripYamlComments(text) {
     return out;
   }).join('\n');
 }
-
+function bare(key) {
+  if (WF[key].bare == null) {
+    const stripped = stripYamlComments(wf(key));
+    for (const need of ['jobs:', 'runs-on:', 'uses:']) {
+      expectTrue(stripped.includes(need), `剥注释后 ${WF[key].path} 里连 ${need} 都没了`, `原文 ${wf(key).length} 字节 -> 剥后 ${stripped.length} 字节，扫描器坏了`);
+    }
+    const lines = stripped.split('\n').filter(l => l.trim() !== '').length;
+    expectTrue(lines >= 20, `剥注释后 ${WF[key].path} 只剩 ${lines} 行非空内容，扫描器坏了`);
+    WF[key].bare = stripped;
+  }
+  return WF[key].bare;
+}
 function onBlock(text) {
   const lines = text.split('\n');
   const start = lines.findIndex(l => l.trimEnd() === 'on:');
@@ -265,11 +208,6 @@ function onBlock(text) {
   }
   return out;
 }
-
-// 注意：一个 job 之前的注释块会被算进**上一个** job 的 lines 里。所以任何
-// 「这个 job 的文本里不该出现 X」的断言都必须去读具体那一行（needs / uses），
-// 不能对整段做子串匹配。实测踩过：attest 之前那段说明注释里反复提到 attest，
-// 于是「summary 的 needs 里不许有 attest」误报成环。
 function jobBlocks(text) {
   const lines = text.split('\n');
   const start = lines.findIndex(l => l.trimEnd() === 'jobs:');
@@ -291,12 +229,9 @@ function needsOf(job) {
   if (!line) return null;
   return line.replace(/.*\[/, '').replace(/\].*/, '').split(',').map(s => s.trim()).filter(Boolean);
 }
-
-// job 级 if 只出现在缩进 4 空格的位置。step 级的 if 缩进更深，不算。
 function jobLevelIfs(job) {
   return job.lines.filter(l => /^ {4}if:/.test(l)).map(l => l.trim());
 }
-
 function runBlocks(text) {
   const lines = text.split('\n');
   const blocks = [];
@@ -316,13 +251,6 @@ function runBlocks(text) {
   }
   return blocks;
 }
-
-// 「某段脚本里必须出现 X」这类断言，必须先把那段切出来再找 —— 否则它退化成
-// 「整个文件里存在 X」，而同一个文件里到处都有 `exit 1` 这种东西。
-// 2026-08-14 实测抓到的那条装饰就是这么来的（见 mirror 那条断言的注释）。
-//
-// 顺手剔掉 shell 注释行：run 块内部的 `# ...` 是文档，不是会执行的语句。
-// 这和 stripYamlComments 是同一条道理，只是层级不同。
 function blocksContaining(text, needle) {
   return runBlocks(text)
     .filter(b => b.body.includes(needle))
@@ -331,12 +259,9 @@ function blocksContaining(text, needle) {
       code: b.body.split('\n').filter(l => !/^\s*#/.test(l)).join('\n')
     }));
 }
-
 function matrixSlugs(text) {
   return [...text.matchAll(/^\s*slug:\s*([A-Za-z0-9_-]+)\s*$/gm)].map(m => m[1]);
 }
-// ${{matrix.slug}} 一律写成不带空格的形式，这样 token 里不含空白，扫描器可以
-// 用「非空白直到 .log」切出来。带空格的写法会把这条扫描悄悄变成零命中。
 function expandMatrix(text, token) {
   if (!token.includes('${{')) return [token];
   if (!token.includes('${{matrix.slug}}')) {
@@ -344,7 +269,6 @@ function expandMatrix(text, token) {
   }
   return matrixSlugs(text).map(s => token.split('${{matrix.slug}}').join(s));
 }
-// 只吃剥过注释的文本。说明注释里提到一个产物名或日志名是文档，不是配置。
 function tokenSet(key, re) {
   const text = bare(key);
   const out = new Set();
@@ -353,15 +277,7 @@ function tokenSet(key, re) {
 }
 const RE_REPORT = /name:\s*(report-[^\s]+)/g;
 const RE_STDOUT = /stdout-([^\s`'"]+?)\.log/g;
-// 回写那行的引用。@ 后面必须是 40 位十六进制，不许是分支或 tag —— 见那条断言。
-const RE_WRITEBACK = /uses:\s*supercubegame\/ci-workflows\/\.github\/workflows\/report\.yml@([^\s]+)/g;
-
-// 从 AGENTS.md 拆到 docs/PITFALLS.md 的两节。它们的性质和别的不一样：随经验
-// 单调增长的档案，而 AGENTS.md 是每次都要读进上下文的指令。混在一起会让
-// 200 行上限反复顶格，然后有人去调宽它 —— 而调宽一条上限就是把断言改成装饰。
 const MOVED_SECTIONS = ['## 闸门红了先查夹具', '## 测不出来的'];
-
-// ---------------------------------------------------------------- 检查清单
 const report = new Report('快闸门（纯核心 + 静态断言）');
 
 const CHECKS = [
@@ -561,16 +477,6 @@ const CHECKS = [
     return '(-500,-500) -> (0,0)，(5000,5000) -> (480,400)';
   }],
 
-  // 这条是 2026-08-14 逐条复核 PITFALLS「测不出来的」时补上的，而且它补的是
-  // 那一节里**一句写错的话**：「clampBounds 的多屏分支在 CI 里根本走不到」。
-  //
-  // 那句话把两件事混成了一件。端到端闸门走不到是真的 —— xvfb 里没有窗口管理器，
-  // 也只有一个屏。但 **clampBounds 是纯函数，area 只是个普通参数**：快闸门想喂
-  // 什么工作区就喂什么。把「端到端测不了」写成「测不了」，代价是那个方向被
-  // 永久豁免了监督 —— 没人会去核对一件已经宣布无法核对的事。
-  //
-  // 代价是实测出来的，不是推的：上面那两条断言喂的 area 原点全是 (0,0)，于是把
-  // 函数里的 a.x / a.y 整个换成字面量 0，**58 条断言一条都不会红**。
   ['窗口：非零原点的工作区也夹得对（副屏 / 负坐标 / 任务栏偏移），含变异体自证', () => {
     const c = getCore();
     const RIGHT = { x: 1920, y: 0, width: 1920, height: 1080 };
@@ -581,8 +487,6 @@ const CHECKS = [
       ['顶部任务栏的 y 偏移', { x: 0, y: 0, width: 800, height: 600 }, { x: 0, y: 48, width: 1920, height: 1032 }, { x: 0, y: 48, width: 800, height: 600 }]
     ];
     for (const [name, bounds, area, want] of cases) expectEq(c.clampBounds(bounds, area), want, name);
-
-    // 变异体：只把工作区原点当成 0，其它逻辑逐字照抄。
     function originBlind(b, a) {
       const w = Math.max(480, Math.min(Math.round(b.width), a.width));
       const h = Math.max(360, Math.min(Math.round(b.height), a.height));
@@ -592,8 +496,6 @@ const CHECKS = [
         width: w, height: h
       };
     }
-    // 先证明它是个**像样的**变异体：在零原点的工作区上它和真货完全一致。
-    // 这一步不做的话，这条自证就退化成「随便造个坏函数当然会红」。
     const zero = { x: 0, y: 0, width: 1280, height: 1000 };
     for (const b of [{ x: -500, y: -500, width: 800, height: 600 }, { x: 5000, y: 5000, width: 800, height: 600 }]) {
       expectEq(originBlind(b, zero), c.clampBounds(b, zero),
@@ -651,7 +553,6 @@ const CHECKS = [
     return `丢弃 4 条 + 主题回默认，共记录 ${r.issues.length} 条 issue`;
   }],
 
-  // ------------------------------------------------------------ 撤销 / 重做
   ['历史：初始为空，记录一次后深度 1（摘要正确）', () => {
     const h = getHist();
     const empty = h.createHistory();
@@ -725,9 +626,6 @@ const CHECKS = [
     return `上限 ${limit}：推 ${limit + 1} 次后深度恰好 ${limit}，最初那份已被挤出（栈底变成有 1 条的状态）`;
   }],
 
-  // 这条的后半段（主进程 / preload / 界面三处都接上了）原来在**没剥注释**的
-  // 原文上找关键词。2026-08-14 实测：把那三处的真实代码全删掉、只在注释里
-  // 提到它们，这条照样绿。现在走 codeOf()，并带一个变异体自证。
   ['历史：不进存档，且主进程与界面都真的接上了（读可执行代码，含变异体自证）', () => {
     const c = getCore();
     const h = getHist();
@@ -736,9 +634,6 @@ const CHECKS = [
     expectEq(JSON.parse(raw).history, undefined, '存档里的 history 字段');
     expectEq(Object.keys(JSON.parse(raw)).sort(), ['bounds', 'settings', 'todos', 'version'], '存档的顶层字段');
     expectEq(c.deserialize(raw).state.history, undefined, '读回来的 state 里的 history 字段');
-
-    // 光有核心不够：主进程、preload、界面三处都要真的接上，否则功能对用户
-    // 不存在，而上面那几条照样全绿 —— 那是覆盖缺口。
     const mainNeedles = ["ipcMain.handle('history:undo'", "ipcMain.handle('history:redo'", 'hist.record'];
     const mainCode = codeOf('src/main/main.js');
     expectEq(missingNeedles(mainCode, mainNeedles), [], 'main.js 里缺的接线（只看可执行代码）');
@@ -747,9 +642,6 @@ const CHECKS = [
     const htmlCode = codeOf('src/renderer/index.html');
     expectEq(missingNeedles(htmlCode, ['data-testid="undo"', 'data-testid="redo"']), [], '界面上缺的按钮');
     expectEq(h.summary(h.createHistory()).undoDepth, 0, '摘要的初始深度');
-
-    // 自证：把那条 IPC 注册换成一句 TODO 注释。剥注释之后必须判红,
-    // 而在**没剥注释**的原文上它会活下来，那正是这条断言之前的样子。
     const tampered = readIfExists('src/main/main.js')
       .replace("ipcMain.handle('history:undo'", "// TODO 接回来：ipcMain.handle('history:undo'");
     expectTrue(tampered !== readIfExists('src/main/main.js'), '构造变异体时没替换到任何东西 —— 夹具坏了');
@@ -772,8 +664,6 @@ const CHECKS = [
     for (const f of files) {
       const rel = path.relative(ROOT, f);
       const raw = fs.readFileSync(f, 'utf8');
-      // 只扫会执行的代码。注释里写「别往里塞 Date.now()」是文档，不是违规 ——
-      // 上一版没剥注释，第一次跑就被自己的说明文字抓了，根因在夹具不在产品。
       const code = stripComments(raw);
       expectTrue(code.includes('module.exports'), `剥注释后 ${rel} 里连 module.exports 都没了`, `原文 ${raw.length} 字节 -> 剥后 ${code.length} 字节，扫描器坏了`);
       expectTrue(code.length > raw.length * 0.4, `剥注释把 ${rel} 剥掉了太多`, `${raw.length} -> ${code.length} 字节`);
@@ -797,24 +687,15 @@ const CHECKS = [
     return '查询、序列化、记录历史各跑两次，结果逐字节一致';
   }],
 
-  // 这条原来在没剥注释的原文上找那四个关键词。实测：把 clampBounds / setBounds /
-  // minWidth / minHeight 的真实调用全删掉、只写一句「原来这里会 clampBounds +
-  // setBounds」的注释，它照样绿。
-  //
-  // 负向那侧同时也是错的：一句「注意：绝对不要写成 resizable: false」的注释会让
-  // 它**误报成红**。剥注释一次修好两侧,这就是为什么剥注释要做在扫描器里，
-  // 而不是靠「别在注释里提这些词」的约定（拿产品迁就尺子）。
   ['主进程：窗口可调整大小且用 clampBounds 恢复（读可执行代码，含变异体自证）', () => {
     const needles = ['minWidth', 'minHeight', 'clampBounds', 'setBounds'];
     const code = codeOf('src/main/main.js');
     expectEq(missingNeedles(code, needles), [], 'main.js 里缺的窗口关键词（只看可执行代码）');
-    // 负向：真的把窗口设成不可调整大小要红,而注释里提到这串字不算。
     expectTrue(!code.includes('resizable: false'), 'main.js 把窗口设成了不可调整大小',
       '需求要求窗口大小可以随意调节。注意这条只看可执行代码 —— 注释里提到这串字不算违规。');
     expectTrue(code.includes('resizable: true'), 'main.js 里找不到 resizable: true',
       '光断言「没有 false」是空断言：整段配置被删掉也会通过。正向那侧必须也在。');
 
-    // 自证一：把四个关键词的真实调用注释掉，剥注释后必须判红。
     const raw = readIfExists('src/main/main.js');
     const blinded = raw
       .replace('core.clampBounds(state.bounds, workArea())', '/* core.clampBounds(...) */ state.bounds')
@@ -826,7 +707,6 @@ const CHECKS = [
       '把真实调用注释掉之后仍然没判红 —— 那这条还是装饰',
       '这正是旧版的行为：它在没剥注释的原文上找关键词，而注释里那几个词照样命中。');
 
-    // 自证二：负向那侧不许被注释误报。
     const commented = raw.replace('    resizable: true,', '    // 别写成 resizable: false\n    resizable: true,');
     expectTrue(commented !== raw, '构造注释变异体时没替换到任何东西 —— 夹具坏了');
     expectTrue(!stripComments(commented).includes('resizable: false'),
@@ -846,8 +726,6 @@ const CHECKS = [
     expectTrue(preCode.includes('contextBridge'), 'preload 没走 contextBridge（只看可执行代码）',
       preCode.slice(0, 300));
 
-    // 自证：把三条安全设置注掉,这是调试时最常见的动作，也是这条断言唯一
-    // 要防的那件事。剥注释后必须判红；在原文上它会活下来（旧版的行为）。
     const raw = readIfExists('src/main/main.js');
     const unsafe = raw
       .replace('      contextIsolation: true,', '      // 先注掉调试：contextIsolation: true,')
@@ -858,7 +736,6 @@ const CHECKS = [
     expectTrue(missingNeedles(stripComments(unsafe), needles).length >= 2,
       '注掉两条安全设置之后没判红 —— 那这条还是装饰');
 
-    // preload 那侧同样自证：改成直接挂 window，contextBridge 只剩注释。
     const preRaw = readIfExists('src/preload/preload.js');
     const leaky = stripComments(preRaw).split('contextBridge').join('window.__x');
     expectTrue(!leaky.includes('contextBridge'), '构造 preload 变异体失败 —— 夹具坏了');
@@ -969,28 +846,26 @@ const CHECKS = [
     return `${Object.keys(WF).length} 份 workflow、${totalRun} 个 run 块，其中 ${totalTee} 个用了 tee，全部带 pipefail（否则闸门红了 job 照样绿）`;
   }],
 
-  ['CI：回写 job 用共享 workflow、钉在 40 位 SHA、四份钉同一个、本地零 steps', () => {
-    const bad = [];
-    const pins = new Set();
+  ['CI：回写 job 用共享 workflow、跟随 main、四份跟同一个、 本地零 steps，含 pin-guard 自证', () => {
+    const entries = [];
     for (const key of Object.keys(WF)) {
       const jobs = jobBlocks(bare(key));
       const j = jobs.get('summary');
       expectTrue(Boolean(j), `${WF[key].path} 里没有 summary job —— 送不出结论的闸门等于没跑`, [...jobs.keys()].join(','));
-      const refs = [...j.text.matchAll(RE_WRITEBACK)].map(m => m[1]);
-      if (refs.length !== 1) {
-        bad.push(`${WF[key].path} 引用共享回写 workflow 的次数是 ${refs.length}，应该恰好 1 次`);
-        continue;
-      }
-      const ref = refs[0];
-      if (!/^[0-9a-f]{40}$/.test(ref)) {
-        bad.push(`${WF[key].path} 把回写钉在 ${ref} 上，不是 40 位 SHA（分支和 tag 都是可变引用）`);
-      }
-      pins.add(ref);
-      if (j.lines.some(l => l.trim() === 'steps:')) bad.push(`${WF[key].path} 的 summary 自己长出了 steps`);
+      entries.push({
+        path: WF[key].path,
+        summaryText: j.text,
+        hasLocalSteps: j.lines.some(l => l.trim() === 'steps:')
+      });
     }
-    expectEq(bad, [], '回写 job 的问题');
-    expectEq(pins.size, 1, '四份 workflow 钉住的 SHA 个数（多于一个说明只更新了一半）');
-    return `${Object.keys(WF).length} 份 workflow 全部钉在 ${[...pins][0].slice(0, 7)}，本地零 steps`;
+    const live = writebackRefProblems(entries).problems;
+    expectEq(live, [], '回写引用的判词');
+
+    const proof = pinGuardSelfProof();
+    const bad = proof.filter(p => !p.ok);
+    expectEq(proof.length, PIN_GUARD_SAMPLES, 'pin-guard 的样本数');
+    expectEq(bad, [], 'pin-guard 自证里失败的样本');
+    return `${entries.length} 份 workflow 全部跟随 main、本地零 steps｜pin-guard ${proof.length}/${proof.length} 自证通过（只翻一半 / 空输入都会红）`;
   }],
 
   ['CI：gates 引用真实的 needs.<job>.result 且与 needs 一致', () => {
@@ -1094,7 +969,7 @@ const CHECKS = [
     expectTrue(Boolean(configured), '扫不到回写步骤里配置的 committer 邮箱 —— 是扫描器坏了，不是配置对了', j.text.slice(0, 600));
     const email = configured[1];
     expectTrue(email.includes('@'), '回写配置的 committer 邮箱不是邮箱形状', email);
-    const guard = new RegExp(`head_commit\\.committer\\.email\\s*!=\\s*'${reEscape(email)}'`);
+    const guard = new RegExp(`head_commit\.committer\.email\s*!=\s*'${reEscape(email)}'`);
     expectTrue(guard.test(text), '回写守卫比较的邮箱与 git config 配的那个不一致',
       `git config 配的是 ${email}\n两处必须逐字相同，否则守卫会哑 —— 而哑掉的表现是自触发循环，不是红。`);
     expectTrue(text.includes("github.actor != 'github-actions[bot]'"), '缺第二层 actor 守卫', j.text.slice(0, 800));
@@ -1115,10 +990,6 @@ const CHECKS = [
     return `${names.size} 个产物 + ${slugs.size} 条日志，与 SHOTS_GATES 完全相等`;
   }],
 
-  // 这条断言的前一版**是装饰**，实测确认过：原文是
-  // `text.includes('MIRROR_TOKEN:-') && text.includes('exit 1')`,两个子串各自在
-  // 整个文件里找，而末尾那个「闸门失败则失败」步骤本来就有一行 `run: exit 1`。
-  // 把守卫里的 exit 1 换成 echo（恰好就是它唯一要防的静默跳过），照样全绿。
   ['CI：mirror 的触发范围、令牌守卫（块内断言 + 变异体自证）与源 SHA 痕迹', () => {
     const text = wf('mirror');
     const on = onBlock(text);
